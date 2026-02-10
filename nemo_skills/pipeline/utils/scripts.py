@@ -75,10 +75,16 @@ class BaseJobScript(run.Script):
             When True, the script spans all nodes specified in the group's num_nodes.
             This is important for multi-node setups with --overlap where the server
             needs multiple nodes but client/sandbox should run on the master node only.
+        num_tasks_override: Override the group's num_tasks for this specific script.
+            When set, this script's srun will use this value for --ntasks-per-node
+            instead of the group's HardwareConfig.num_tasks. Useful when multiple
+            scripts in a CommandGroup need different task configurations (e.g.,
+            vLLM servers needing 2 tasks per node while Gym client needs 1).
     """
 
     het_group_index: Optional[int] = field(default=None, init=False, repr=False)
     span_group_nodes: bool = False  # Default: run on 1 node
+    num_tasks_override: Optional[int] = None  # Per-script task count override
     installation_command: Optional[str] = None
     entrypoint: str = field(default="bash", init=False)
 
@@ -430,5 +436,563 @@ class GenerationClientScript(BaseJobScript):
             return cmd, {"environment": env_vars}
 
         # Always use lazy command building
+        self.set_inline(build_cmd)
+        super().__post_init__()
+
+
+@dataclass(kw_only=True)
+class NemoGymRolloutsScript(BaseJobScript):
+    """Script for running NeMo Gym rollout collection.
+
+    This script orchestrates the full rollout collection workflow:
+    1. Starts ng_run in background to spin up NeMo Gym servers
+    2. Polls ng_status until all servers are healthy
+    3. Runs ng_collect_rollouts to collect rollouts
+    4. Keeps ng_run running (cleanup handled externally)
+
+    Attributes:
+        config_paths: List of YAML config file paths for ng_run
+        input_file: Input JSONL file path for rollout collection
+        output_file: Output JSONL file path for rollouts
+        extra_arguments: Additional Hydra overrides passed to both ng_run and ng_collect_rollouts
+        server: Optional ServerScript reference for policy model server
+        server_address: Optional pre-hosted server address
+        sandbox: Optional SandboxScript reference for sandbox port
+        log_prefix: Prefix for log files (default: "nemo_gym")
+
+    Example:
+        script = NemoGymRolloutsScript(
+            config_paths=[
+                "resources_servers/ns_tools/configs/ns_tools.yaml",
+                "resources_servers/math_with_judge/configs/math_with_judge.yaml",
+            ],
+            input_file="/data/input.jsonl",
+            output_file="/data/rollouts.jsonl",
+            extra_arguments="+agent_name=ns_tools_simple_agent +limit=10",
+            server=server_script,
+            sandbox=sandbox_script,
+        )
+    """
+
+    config_paths: List[str]
+    input_file: str
+    output_file: str
+    extra_arguments: str = ""
+    server: Optional["ServerScript"] = None
+    server_address: Optional[str] = None
+    sandbox: Optional["SandboxScript"] = None
+    gym_path: str = "/opt/NeMo-RL/3rdparty/Gym-workspace/Gym"
+    policy_api_key: str = "dummy"  # API key for policy server (can be dummy for local)
+    policy_model_name: Optional[str] = None  # Model name override for policy server
+
+    log_prefix: str = field(default="nemo_gym", init=False)
+
+    def __post_init__(self):
+        """Initialize the combined ng_run + ng_collect_rollouts script."""
+
+        def build_cmd() -> Tuple[str, Dict]:
+            """Build the full rollout collection command."""
+            # Build config_paths argument
+            config_paths_str = ",".join(self.config_paths)
+
+            # Build ng_run command parts
+            ng_run_parts = [
+                "ng_run",
+                f'"+config_paths=[{config_paths_str}]"',
+            ]
+
+            # Add policy server URL if we have a server reference or address
+            if self.server is not None:
+                server_addr = f"http://{self.server.hostname_ref()}:{self.server.port}/v1"
+                ng_run_parts.append(f'+policy_base_url="{server_addr}"')
+            elif self.server_address is not None:
+                ng_run_parts.append(f'+policy_base_url="{self.server_address}"')
+
+            # Add policy API key (required by some configs)
+            ng_run_parts.append(f'+policy_api_key="{self.policy_api_key}"')
+
+            # Add policy model name (required by configs)
+            if self.policy_model_name:
+                ng_run_parts.append(f'+policy_model_name="{self.policy_model_name}"')
+
+            # Add extra arguments to ng_run
+            if self.extra_arguments:
+                ng_run_parts.append(self.extra_arguments)
+
+            ng_run_cmd = " ".join(ng_run_parts)
+
+            # Build ng_collect_rollouts command
+            ng_collect_parts = [
+                "ng_collect_rollouts",
+                f'+input_jsonl_fpath="{self.input_file}"',
+                f'+output_jsonl_fpath="{self.output_file}"',
+            ]
+
+            # Add extra arguments to ng_collect_rollouts
+            if self.extra_arguments:
+                ng_collect_parts.append(self.extra_arguments)
+
+            ng_collect_cmd = " ".join(ng_collect_parts)
+
+            # Compute the vLLM server URL for the wait check
+            if self.server is not None:
+                vllm_server_url = f"http://{self.server.hostname_ref()}:{self.server.port}/v1"
+            elif self.server_address is not None:
+                vllm_server_url = self.server_address
+            else:
+                vllm_server_url = ""
+
+            # Build the full bash script that:
+            # 1. Installs NeMo Gym from 3rdparty/Gym-workspace/Gym
+            # 2. Waits for vLLM server to be ready
+            # 3. Starts ng_run in background
+            # 4. Polls ng_status until healthy (with early failure detection)
+            # 5. Runs ng_collect_rollouts
+            cmd = f"""set -e
+set -o pipefail
+
+echo "=== Installing NeMo Gym ==="
+cd {self.gym_path} || {{ echo "ERROR: Failed to cd to Gym directory"; exit 1; }}
+uv venv --python 3.12 --allow-existing .venv || {{ echo "ERROR: Failed to create venv"; exit 1; }}
+source .venv/bin/activate || {{ echo "ERROR: Failed to activate venv"; exit 1; }}
+uv sync --active --extra dev || {{ echo "ERROR: Failed to sync dependencies"; exit 1; }}
+echo "NeMo Gym installed successfully"
+
+# Disable pipefail for the polling loop (grep may return non-zero)
+set +o pipefail
+
+# Wait for vLLM server to be ready before starting ng_run
+# Note: --kill-on-bad-exit in srun ensures job fails if vLLM crashes
+VLLM_SERVER_URL="{vllm_server_url}"
+if [ -n "$VLLM_SERVER_URL" ]; then
+    echo "=== Waiting for vLLM server at $VLLM_SERVER_URL ==="
+    while [ $(curl -s -o /dev/null -w "%{{http_code}}" "$VLLM_SERVER_URL/models" 2>/dev/null) -ne 200 ]; do
+        sleep 10
+    done
+    echo "vLLM server is ready!"
+fi
+
+echo "=== Starting NeMo Gym servers ==="
+{ng_run_cmd} &
+NG_RUN_PID=$!
+echo "ng_run PID: $NG_RUN_PID"
+
+echo "Waiting for NeMo Gym servers..."
+LAST_STATUS=""
+while true; do
+    # Check if ng_run process died - let the failure cascade naturally
+    if ! kill -0 $NG_RUN_PID 2>/dev/null; then
+        echo "ERROR: ng_run process exited unexpectedly"
+        wait $NG_RUN_PID 2>/dev/null  # Get exit code
+        exit 1
+    fi
+
+    STATUS_OUTPUT=$(ng_status 2>&1)
+
+    if echo "$STATUS_OUTPUT" | grep -q "healthy, 0 unhealthy"; then
+        echo "All servers ready!"
+        break
+    fi
+
+    # Only print status when it changes (reduce verbosity)
+    CURRENT_STATUS=$(echo "$STATUS_OUTPUT" | grep -oE '[0-9]+ healthy' | head -1 || echo "starting")
+    if [ "$CURRENT_STATUS" != "$LAST_STATUS" ]; then
+        echo "Server status: $CURRENT_STATUS"
+        LAST_STATUS="$CURRENT_STATUS"
+    fi
+
+    sleep 10
+done
+
+echo "=== Running rollout collection ==="
+echo "Input file: {self.input_file}"
+echo "Output file: {self.output_file}"
+mkdir -p "$(dirname "{self.output_file}")"
+echo "Output directory created: $(dirname "{self.output_file}")"
+echo "Running: {ng_collect_cmd}"
+{ng_collect_cmd} || {{ echo "ERROR: ng_collect_rollouts failed"; kill $NG_RUN_PID 2>/dev/null || true; exit 1; }}
+
+echo "=== Rollout collection complete ==="
+echo "Output: {self.output_file}"
+
+echo "=== Cleaning up ==="
+kill $NG_RUN_PID 2>/dev/null || true
+echo "Servers terminated."
+"""
+            # Build environment variables for sandbox connection
+            # YAML configs use ${oc.env:NEMO_SKILLS_SANDBOX_HOST,127.0.0.1} and
+            # ${oc.env:NEMO_SKILLS_SANDBOX_PORT,6000} to resolve these
+            env_vars = {}
+            if self.sandbox is not None:
+                env_vars["NEMO_SKILLS_SANDBOX_HOST"] = self.sandbox.hostname_ref()
+                env_vars["NEMO_SKILLS_SANDBOX_PORT"] = str(self.sandbox.port)
+
+            return cmd.strip(), {"environment": env_vars}
+
+        self.set_inline(build_cmd)
+        super().__post_init__()
+
+
+@dataclass(kw_only=True)
+class MultiVLLMServerScript(BaseJobScript):
+    """Script for deploying multiple independent vLLM servers for Gym routing.
+
+    This script enables data-parallel vLLM deployments where Gym routes requests
+    across multiple independent vLLM server replicas. Each replica runs on its own
+    set of GPUs and handles requests independently.
+
+    Supports configurations like:
+    - 1 server per node with TP=8 (full node per server)
+    - 2 servers per node with TP=4 each (2 servers sharing a node)
+    - 4 servers per node with TP=2 each
+    - 8 servers per node with TP=1 each
+
+    The script uses SLURM environment variables to determine which server instance
+    to start on each task:
+    - SLURM_PROCID: Global task ID (0 to num_nodes * servers_per_node - 1)
+    - SLURM_LOCALID: Task ID within node (0 to servers_per_node - 1)
+    - SLURM_NODEID: Node ID (0 to num_nodes - 1)
+
+    Attributes:
+        model_path: Path to model weights or HuggingFace model name
+        cluster_config: Cluster configuration dictionary
+        num_nodes: Number of nodes to use
+        servers_per_node: Number of vLLM servers per node
+        gpus_per_server: GPUs per server (tensor_parallel_size)
+        server_args: Additional vLLM server arguments
+        base_port: Starting port (servers use base_port + global_rank)
+
+    Example:
+        # 4 nodes × 2 servers per node = 8 total replicas, each with TP=4
+        servers = MultiVLLMServerScript(
+            model_path="/models/llama-70b",
+            cluster_config=cluster_config,
+            num_nodes=4,
+            servers_per_node=2,
+            gpus_per_server=4,
+            server_args="--dtype auto --max-model-len 8192",
+        )
+
+        # Use in CommandGroup
+        group = CommandGroup(
+            commands=[
+                Command(script=servers, container="vllm", name="vllm"),
+                Command(script=gym_client, container="nemo-skills", name="gym"),
+            ],
+            hardware=HardwareConfig(
+                num_nodes=4,
+                num_gpus=8,
+                num_tasks=2,  # servers_per_node
+            ),
+        )
+    """
+
+    model_path: str
+    cluster_config: Dict
+    num_nodes: int = 1
+    servers_per_node: int = 1
+    gpus_per_server: int = 8
+    server_args: str = ""
+    base_port: Optional[int] = None
+    # Mitigations for vLLM v1 shared-memory communicator instability on some clusters.
+    # When enabled, we export env vars that (if supported by the vLLM version) disable
+    # SHM-based broadcast paths, which are sensitive to /dev/shm sizing and IPC quirks.
+    disable_shm_broadcast: bool = False
+    # Print /dev/shm diagnostics at startup to help debug node-to-node differences.
+    print_shm_diagnostics: bool = False
+
+    # Spans all nodes - each SLURM task runs one server
+    span_group_nodes: bool = True
+
+    # Internal tracking
+    _total_replicas: int = field(init=False, repr=False, default=0)
+    _ports: List[int] = field(init=False, repr=False, default_factory=list)
+    log_prefix: str = field(default="vllm_servers", init=False)
+
+    def __post_init__(self):
+        """Build command for distributed vLLM servers."""
+        self._total_replicas = self.num_nodes * self.servers_per_node
+
+        # Set num_tasks_override to ensure this script gets the right task count
+        self.num_tasks_override = self.servers_per_node
+
+        # Allocate ports
+        if self.base_port is None:
+            self.base_port = get_free_port(strategy="random")
+        self._ports = [self.base_port + i for i in range(self._total_replicas)]
+
+        ports_str = " ".join(str(p) for p in self._ports)
+
+        # Build command that runs one server per SLURM task
+        disable_shm_broadcast = "true" if self.disable_shm_broadcast else "false"
+        print_shm_diagnostics = "true" if self.print_shm_diagnostics else "false"
+        cmd = f'''
+#!/bin/bash
+set -e
+
+# Configuration
+PORTS=({ports_str})
+GPUS_PER_SERVER={self.gpus_per_server}
+SERVERS_PER_NODE={self.servers_per_node}
+DISABLE_SHM_BROADCAST={disable_shm_broadcast}
+PRINT_SHM_DIAGNOSTICS={print_shm_diagnostics}
+
+# SLURM environment
+# SLURM_PROCID: Global task ID (0 to num_nodes * servers_per_node - 1)
+# SLURM_LOCALID: Task ID within this node (0 to servers_per_node - 1)
+# SLURM_NODEID: Node ID (0 to num_nodes - 1)
+GLOBAL_RANK=${{SLURM_PROCID:-0}}
+LOCAL_RANK=${{SLURM_LOCALID:-0}}
+NODE_ID=${{SLURM_NODEID:-0}}
+
+# Calculate which GPUs this server should use
+# E.g., with 2 servers per node and 4 GPUs each:
+#   Local rank 0 → GPUs 0,1,2,3
+#   Local rank 1 → GPUs 4,5,6,7
+GPU_START=$((LOCAL_RANK * GPUS_PER_SERVER))
+GPU_END=$((GPU_START + GPUS_PER_SERVER - 1))
+GPU_LIST=$(seq -s, $GPU_START $GPU_END)
+
+# Get port for this server
+MY_PORT=${{PORTS[$GLOBAL_RANK]}}
+
+echo "=== vLLM Server Configuration ==="
+echo "Global Rank: $GLOBAL_RANK"
+echo "Node ID: $NODE_ID"
+echo "Local Rank: $LOCAL_RANK"
+echo "Port: $MY_PORT"
+echo "GPUs: $GPU_LIST (CUDA_VISIBLE_DEVICES)"
+echo "Tensor Parallel Size: {self.gpus_per_server}"
+echo "Model: {self.model_path}"
+echo "================================="
+
+# Debug /dev/shm and IPC-related info (helps with node-to-node variance)
+if [ "$PRINT_SHM_DIAGNOSTICS" = "true" ]; then
+  echo ""
+  echo "=== /dev/shm diagnostics (before vLLM start) ==="
+  df -h /dev/shm || true
+  ls -ld /dev/shm || true
+  mount | grep -E " /dev/shm " || true
+  echo "ulimit -n: $(ulimit -n || true)"
+  echo "==============================================="
+  echo ""
+fi
+
+# Set GPU visibility
+export CUDA_VISIBLE_DEVICES=$GPU_LIST
+
+# Mitigation: attempt to disable vLLM SHM broadcast transport (best-effort, version-dependent).
+# These env vars are intentionally safe: if vLLM doesn't recognize them, they are ignored.
+if [ "$DISABLE_SHM_BROADCAST" = "true" ]; then
+  export VLLM_DISABLE_SHM_BROADCAST=1
+  export VLLM_USE_SHM_BROADCAST=0
+fi
+
+# Start vLLM server
+python3 -m vllm.entrypoints.openai.api_server \\
+    --model "{self.model_path}" \\
+    --host "0.0.0.0" \\
+    --port "$MY_PORT" \\
+    --tensor-parallel-size {self.gpus_per_server} \\
+    --trust-remote-code \\
+    {self.server_args}
+'''
+
+        self.set_inline(cmd)
+        super().__post_init__()
+
+    @property
+    def total_replicas(self) -> int:
+        """Total number of vLLM server replicas."""
+        return self._total_replicas
+
+    @property
+    def ports(self) -> List[int]:
+        """List of ports for all server replicas."""
+        return self._ports
+
+
+@dataclass(kw_only=True)
+class GymClientScript(BaseJobScript):
+    """Script that starts Gym with routing to multiple vLLM servers.
+
+    This script runs on a single node (the master node) and:
+    1. Waits for all vLLM servers to be healthy
+    2. Builds the list of server URLs
+    3. Exports GYM_VLLM_BASE_URLS environment variable
+    4. Starts Gym with the configured command
+
+    Attributes:
+        servers: Reference to MultiVLLMServerScript for server URLs
+        gym_command: Command to run Gym (e.g., "python -m nemo_gym.server ...")
+        health_check_interval: Seconds between health check attempts (default: 10)
+
+    Example:
+        gym_client = GymClientScript(
+            servers=vllm_servers,
+            gym_command="python -m nemo_gym.server --config /path/to/config.yaml",
+        )
+
+        # In same CommandGroup as vllm_servers
+        group = CommandGroup(
+            commands=[
+                Command(script=vllm_servers, container="vllm", name="vllm"),
+                Command(script=gym_client, container="nemo-skills", name="gym"),
+            ],
+            ...
+        )
+    """
+
+    servers: "MultiVLLMServerScript"
+    gym_command: str
+    health_check_interval: int = 10  # Seconds between health check attempts
+
+    # Runs only on master node, single task
+    span_group_nodes: bool = False
+    num_tasks_override: int = 1
+
+    log_prefix: str = field(default="gym", init=False)
+
+    def __post_init__(self):
+        """Build command that waits for servers then starts Gym."""
+
+        def build_cmd() -> Tuple[str, Dict]:
+            ports_str = " ".join(str(p) for p in self.servers.ports)
+            num_servers = self.servers.total_replicas
+            num_nodes = self.servers.num_nodes
+            servers_per_node = self.servers.servers_per_node
+
+            cmd = f"""
+#!/bin/bash
+set -e
+
+echo "=== Gym Client Starting ==="
+echo "Waiting for {num_servers} vLLM servers across {num_nodes} nodes..."
+echo "No timeout - will wait until servers are ready or job is cancelled."
+echo "If vLLM servers crash, the job will fail."
+
+# Configuration
+PORTS=({ports_str})
+NUM_NODES={num_nodes}
+SERVERS_PER_NODE={servers_per_node}
+HEALTH_CHECK_INTERVAL={self.health_check_interval}
+
+# Expand SLURM_JOB_NODELIST without scontrol (not available in containers)
+# Uses Python to parse the compressed node list format (e.g., "node[001-004]")
+expand_nodelist() {{
+    python3 -c "
+import re
+import sys
+
+nodelist = sys.argv[1]
+nodes = []
+
+# Handle comma-separated parts
+for part in re.split(r',(?![^\\[]*\\])', nodelist):
+    # Check if it has a range like prefix[001-003,005]
+    match = re.match(r'(.*)\\[([^\\]]+)\\](.*)', part)
+    if match:
+        prefix, ranges, suffix = match.groups()
+        for r in ranges.split(','):
+            if '-' in r:
+                start, end = r.split('-')
+                width = len(start)
+                for i in range(int(start), int(end) + 1):
+                    nodes.append(f'{{prefix}}{{i:0{{width}}d}}{{suffix}}')
+            else:
+                nodes.append(f'{{prefix}}{{r}}{{suffix}}')
+    else:
+        nodes.append(part)
+
+print(' '.join(nodes))
+" "$1"
+}}
+
+# Get all node hostnames.
+# IMPORTANT: depending on how the step is launched, some clusters populate only one of these.
+# We'll pick the candidate that expands to the most nodes, and verify it matches NUM_NODES.
+BEST_NODES_STR=""
+BEST_COUNT=0
+for VAR_NAME in SLURM_JOB_NODELIST SLURM_NODELIST SLURM_STEP_NODELIST; do
+    NL="${{!VAR_NAME:-}}"
+    if [ -z "$NL" ]; then
+        continue
+    fi
+    EXPANDED="$(expand_nodelist "$NL" || true)"
+    COUNT="$(echo "$EXPANDED" | wc -w | tr -d ' ')"
+    if [ "$COUNT" -gt "$BEST_COUNT" ]; then
+        BEST_COUNT="$COUNT"
+        BEST_NODES_STR="$EXPANDED"
+        BEST_VAR_NAME="$VAR_NAME"
+    fi
+done
+
+if [ "$BEST_COUNT" -lt "$NUM_NODES" ]; then
+    echo "ERROR: Could not discover enough node hostnames for NUM_NODES=$NUM_NODES"
+    echo "  Best candidate: ${{BEST_VAR_NAME:-<none>}} -> $BEST_COUNT nodes: '${{BEST_NODES_STR:-}}'"
+        echo "  SLURM_JOB_NODELIST='${{SLURM_JOB_NODELIST:-}}'"
+        echo "  SLURM_NODELIST='${{SLURM_NODELIST:-}}'"
+        echo "  SLURM_STEP_NODELIST='${{SLURM_STEP_NODELIST:-}}'"
+    exit 1
+fi
+
+read -ra NODES <<< "$BEST_NODES_STR"
+echo "Nodes (from $BEST_VAR_NAME): ${{NODES[*]}}"
+
+# Build URL list and wait for each server (no timeout - wait indefinitely)
+URLS=""
+GLOBAL_IDX=0
+START_TIME=$(date +%s)
+
+for NODE_IDX in $(seq 0 $((NUM_NODES - 1))); do
+    NODE=${{NODES[$NODE_IDX]}}
+    if [ -z "$NODE" ]; then
+        echo "ERROR: Empty NODE at index $NODE_IDX. Nodes: ${{NODES[*]}}"
+        exit 1
+    fi
+
+    for LOCAL_IDX in $(seq 0 $((SERVERS_PER_NODE - 1))); do
+        PORT=${{PORTS[$GLOBAL_IDX]}}
+        URL="http://${{NODE}}:${{PORT}}/v1"
+
+        echo "Waiting for server $GLOBAL_IDX at $URL..."
+        ATTEMPT=0
+        while true; do
+            ATTEMPT=$((ATTEMPT + 1))
+            if curl -s "${{URL}}/health" > /dev/null 2>&1; then
+                ELAPSED=$(($(date +%s) - START_TIME))
+                echo "  ✓ Server $GLOBAL_IDX is ready (after ${{ELAPSED}}s total)"
+                break
+            fi
+            # Log progress every 60 seconds
+            if [ $((ATTEMPT % (60 / HEALTH_CHECK_INTERVAL))) -eq 0 ]; then
+                ELAPSED=$(($(date +%s) - START_TIME))
+                echo "  ... still waiting for server $GLOBAL_IDX (${{ELAPSED}}s elapsed)"
+            fi
+            sleep $HEALTH_CHECK_INTERVAL
+        done
+
+        if [ -n "$URLS" ]; then URLS="$URLS,"; fi
+        URLS="${{URLS}}$URL"
+        GLOBAL_IDX=$((GLOBAL_IDX + 1))
+    done
+done
+
+TOTAL_TIME=$(($(date +%s) - START_TIME))
+echo ""
+echo "=== All {num_servers} servers ready! (took ${{TOTAL_TIME}}s) ==="
+echo "Server URLs: $URLS"
+echo ""
+
+# Export for Gym to use
+export GYM_VLLM_BASE_URLS="$URLS"
+
+# Run Gym
+echo "Starting Gym..."
+{self.gym_command}
+"""
+
+            return cmd.strip(), {"environment": {}}
+
         self.set_inline(build_cmd)
         super().__post_init__()

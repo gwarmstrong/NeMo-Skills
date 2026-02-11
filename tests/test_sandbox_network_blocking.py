@@ -39,6 +39,7 @@ def blocked_sandbox():
     """Start a sandbox with network blocking enabled."""
     client = docker.from_env()
     port = get_free_port(strategy="random")
+    worker_base_port = get_free_port(strategy="random")
     name = f"sandbox-block-test-{port}"
 
     container = client.containers.run(
@@ -46,7 +47,12 @@ def blocked_sandbox():
         detach=True,
         name=name,
         network_mode="host",
-        environment={"NGINX_PORT": str(port), "NUM_WORKERS": "1", "NEMO_SKILLS_SANDBOX_BLOCK_NETWORK": "1"},
+        environment={
+            "NGINX_PORT": str(port),
+            "NUM_WORKERS": "1",
+            "NEMO_SKILLS_SANDBOX_BLOCK_NETWORK": "1",
+            "SANDBOX_WORKER_BASE_PORT": str(worker_base_port),
+        },
     )
 
     # Wait for health
@@ -165,9 +171,9 @@ else:
         """LLM tries: subprocess with env={} to clear LD_PRELOAD"""
         sandbox = LocalSandbox(host="127.0.0.1", port=str(blocked_sandbox))
         code = """
-import subprocess
+import subprocess, sys
 code = 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); print("BYPASS_WORKED")'
-result = subprocess.run(["python3", "-c", code], env={}, capture_output=True, text=True)
+result = subprocess.run([sys.executable, "-c", code], env={}, capture_output=True, text=True)
 if "BYPASS_WORKED" in result.stdout:
     print("ENV_CLEAR_BYPASS_WORKED")
 else:

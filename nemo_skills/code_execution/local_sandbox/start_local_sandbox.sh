@@ -22,7 +22,6 @@ docker build --tag=${SANDBOX_NAME} --build-arg="NUM_WORKERS=$((`nproc --all`))" 
 echo "Multi-worker mode: Starting $((`nproc --all`)) workers with session affinity"
 docker run --network=host --rm \
     --memory=${NEMO_SKILLS_SANDBOX_MEM_LIMIT:-"16g"} \
-    ${UWSGI_CPU_AFFINITY:+-e UWSGI_CPU_AFFINITY=${UWSGI_CPU_AFFINITY}} \
-    ${UWSGI_PROCESSES:+-e UWSGI_PROCESSES=${UWSGI_PROCESSES}} \
+    ${GUNICORN_WORKERS:+-e GUNICORN_WORKERS=${GUNICORN_WORKERS}} \
     -v /nemo_run:/nemo_run \
     --name=local-sandbox ${SANDBOX_NAME}

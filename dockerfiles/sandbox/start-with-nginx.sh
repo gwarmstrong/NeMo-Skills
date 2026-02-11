@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start nginx load balancer with multiple uwsgi workers
+# Start nginx load balancer with multiple gunicorn workers
 # Uses TCP sockets for workers, supporting both single-node and multi-node deployments.
 #
 # Multi-node is auto-detected from SLURM environment variables.
@@ -13,20 +13,18 @@
 #   NGINX_PORT              Port nginx listens on (default: 6000, set in Dockerfile)
 #
 # Optional — Worker Configuration:
-#   NUM_WORKERS             Number of uWSGI workers per node (default: $(nproc --all))
+#   NUM_WORKERS             Number of gunicorn instances per node (default: $(nproc --all))
 #   SANDBOX_WORKER_BASE_PORT
 #                           Starting TCP port for workers (default: 50001). Workers
 #                           bind to sequential ports: base, base+1, ..., base+N-1.
 #                           If a port is already in use, the startup algorithm retries
 #                           with offset increments.
-#   STATEFUL_SANDBOX        Set to 1 (default) for stateful mode: each uWSGI worker
-#                           runs a single process to preserve Jupyter kernel sessions
+#   STATEFUL_SANDBOX        Set to 1 (default) for stateful mode: each gunicorn instance
+#                           runs a single worker process to preserve Jupyter kernel sessions
 #                           across requests. Set to 0 for stateless mode where
-#                           UWSGI_PROCESSES and UWSGI_CHEAPER take effect.
-#   UWSGI_PROCESSES         uWSGI processes per worker (default: 1). Only used when
-#                           STATEFUL_SANDBOX=0.
-#   UWSGI_CHEAPER           uWSGI cheaper mode: minimum number of active processes
-#                           (default: 1). Only used when STATEFUL_SANDBOX=0.
+#                           GUNICORN_WORKERS takes effect.
+#   GUNICORN_WORKERS        Gunicorn worker processes per instance (default: 1). Only used
+#                           when STATEFUL_SANDBOX=0.
 #
 # Optional — Multi-Node (SLURM):
 #   SLURM_JOB_NODELIST      SLURM-provided compressed nodelist (e.g., "node[001-016]").
@@ -47,17 +45,36 @@
 #   NEMO_SKILLS_SANDBOX_BLOCK_NETWORK
 #                           Set to 1 to enable network blocking for sandboxed code.
 #                           Uses /etc/ld.so.preload to intercept socket() calls in
-#                           all new processes. Applied AFTER nginx/uWSGI start so
+#                           all new processes. Applied AFTER nginx/gunicorn start so
 #                           the API remains functional. Note: in any mode, if a
 #                           worker crashes the monitoring loop will attempt to restart
 #                           it, but the new process will be unable to bind its socket.
 #                           The remaining workers continue serving. (default: 0)
+#
+# Deprecated (logged warning if set):
+#   UWSGI_PROCESSES         Use GUNICORN_WORKERS instead.
+#   UWSGI_CHEAPER           No gunicorn equivalent; ignored.
+#   UWSGI_CPU_AFFINITY      No gunicorn equivalent; ignored.
 #
 # =============================================================================
 
 set -e
 
 export NUM_WORKERS=${NUM_WORKERS:-$(nproc --all)}
+
+# =============================================================================
+# Deprecation warnings for old uWSGI env vars
+# =============================================================================
+if [ -n "$UWSGI_PROCESSES" ]; then
+    echo "WARNING: UWSGI_PROCESSES is deprecated. Use GUNICORN_WORKERS instead."
+    : "${GUNICORN_WORKERS:=$UWSGI_PROCESSES}"
+fi
+if [ -n "$UWSGI_CHEAPER" ]; then
+    echo "WARNING: UWSGI_CHEAPER is deprecated and has no gunicorn equivalent. Ignoring."
+fi
+if [ -n "$UWSGI_CPU_AFFINITY" ]; then
+    echo "WARNING: UWSGI_CPU_AFFINITY is deprecated and has no gunicorn equivalent. Ignoring."
+fi
 
 # =============================================================================
 # Utility functions
@@ -111,38 +128,28 @@ print(' '.join(expand_nodelist(sys.argv[1])))
 " "$nodelist" 2>/dev/null
 }
 
-# Start a single uWSGI worker in the background.
+# Start a single gunicorn instance in the background.
 # Args: $1=worker_number $2=port
 # Prints: "pid:port"
 start_worker_fast() {
     local i=$1
     local WORKER_PORT=$2
 
-    cat > /tmp/worker${i}_uwsgi.ini << EOF
-[uwsgi]
-module = main
-callable = app
-processes = ${UWSGI_PROCESSES}
-http-socket = 0.0.0.0:${WORKER_PORT}
-vacuum = true
-master = true
-die-on-term = true
-memory-report = true
-listen = 100
-http-timeout = 300
-socket-timeout = 300
-disable-logging = false
-log-date = true
-log-prefix = [worker${i}]
-logto = /var/log/worker${i}.log
-EOF
-
-    if [ -n "$UWSGI_CHEAPER" ]; then
-        echo "cheaper = ${UWSGI_CHEAPER}" >> /tmp/worker${i}_uwsgi.ini
-    fi
-
     > /var/log/worker${i}.log
-    ( cd /app && env WORKER_NUM=$i uwsgi --ini /tmp/worker${i}_uwsgi.ini ) &
+    # Redirect stdout/stderr to the log file so the $() subshell that calls
+    # this function doesn't block waiting for the pipe to close.
+    # (uWSGI's --logto closed stdout implicitly; gunicorn does not.)
+    ( cd /app && env WORKER_NUM=$i \
+        gunicorn main:app \
+            --workers ${GUNICORN_WORKERS} \
+            --bind 0.0.0.0:${WORKER_PORT} \
+            --timeout 300 \
+            --graceful-timeout 30 \
+            --backlog 100 \
+            --access-logfile /var/log/worker${i}.log \
+            --error-logfile /var/log/worker${i}.log \
+            --log-level info \
+    ) >> /var/log/worker${i}.log 2>&1 &
     echo "$!:$WORKER_PORT"
 }
 
@@ -156,6 +163,11 @@ start_worker() {
 
 worker_had_port_conflict() {
     grep -q "Address already in use" /var/log/worker${1}.log 2>/dev/null
+}
+
+# Check if a TCP port is available (not in use).
+port_is_free() {
+    ! ss -tln "sport = :$1" 2>/dev/null | grep -q LISTEN
 }
 
 worker_is_alive() {
@@ -342,51 +354,18 @@ UPSTREAM_FILE="/tmp/upstream_servers.conf"
 echo "[$_H] Workers/node: $NUM_WORKERS | Base port: $SANDBOX_WORKER_BASE_PORT | Nginx: $NGINX_PORT"
 
 # =============================================================================
-# uWSGI configuration
+# Gunicorn configuration
 # =============================================================================
 : "${STATEFUL_SANDBOX:=1}"
 if [ "$STATEFUL_SANDBOX" -eq 1 ]; then
-    UWSGI_PROCESSES=1
-    UWSGI_CHEAPER=1
+    GUNICORN_WORKERS=1
 else
-    : "${UWSGI_PROCESSES:=1}"
-    : "${UWSGI_CHEAPER:=1}"
+    : "${GUNICORN_WORKERS:=1}"
 fi
 
-export UWSGI_PROCESSES UWSGI_CHEAPER
+export GUNICORN_WORKERS
 
-echo "UWSGI settings: PROCESSES=$UWSGI_PROCESSES, CHEAPER=$UWSGI_CHEAPER"
-
-# Validate and fix uwsgi configuration
-if [ -z "$UWSGI_PROCESSES" ]; then
-    UWSGI_PROCESSES=2
-fi
-
-if [ -z "$UWSGI_CHEAPER" ]; then
-    UWSGI_CHEAPER=1
-elif [ "$UWSGI_CHEAPER" -le 0 ]; then
-    echo "WARNING: UWSGI_CHEAPER ($UWSGI_CHEAPER) must be at least 1"
-    UWSGI_CHEAPER=1
-    echo "Setting UWSGI_CHEAPER to $UWSGI_CHEAPER"
-elif [ "$UWSGI_CHEAPER" -ge "$UWSGI_PROCESSES" ]; then
-    echo "WARNING: UWSGI_CHEAPER ($UWSGI_CHEAPER) must be lower than UWSGI_PROCESSES ($UWSGI_PROCESSES)"
-    if [ "$UWSGI_PROCESSES" -eq 1 ]; then
-        # For single process, disable cheaper mode entirely
-        echo "Disabling cheaper mode for single process setup"
-        UWSGI_CHEAPER=""
-    else
-        UWSGI_CHEAPER=$((UWSGI_PROCESSES - 1))
-        echo "Setting UWSGI_CHEAPER to $UWSGI_CHEAPER"
-    fi
-fi
-
-export UWSGI_PROCESSES
-if [ -n "$UWSGI_CHEAPER" ]; then
-    export UWSGI_CHEAPER
-    echo "UWSGI config - Processes: $UWSGI_PROCESSES, Cheaper: $UWSGI_CHEAPER"
-else
-    echo "UWSGI config - Processes: $UWSGI_PROCESSES, Cheaper: disabled"
-fi
+echo "Gunicorn settings: WORKERS=$GUNICORN_WORKERS"
 
 # =============================================================================
 # Log setup
@@ -416,7 +395,7 @@ cleanup() {
             kill -TERM "$pid" 2>/dev/null || true
         fi
     done
-    pkill -f nginx || true
+    nginx -s quit 2>/dev/null || kill "$(cat /run/nginx.pid 2>/dev/null)" 2>/dev/null || true
     [ -n "$HEALTH_CHECK_DIR" ] && rm -rf "$HEALTH_CHECK_DIR" 2>/dev/null || true
     [ -n "$REMOTE_HEALTH_DIR" ] && rm -rf "$REMOTE_HEALTH_DIR" 2>/dev/null || true
     exit 0
@@ -432,48 +411,32 @@ for i in $(seq 1 $NUM_WORKERS); do
     ACTUAL_WORKER_PORTS+=("")
 done
 
-# Phase 1: Spawn all workers simultaneously
+# Phase 1: Pre-check ports and spawn all workers simultaneously.
+# Gunicorn retries binding 5 times with 1s sleep (hardcoded in gunicorn/sock.py),
+# so a port conflict wastes ~5s per worker. Pre-checking with ss avoids this.
 echo "[$_H] Starting $NUM_WORKERS workers (ports $SANDBOX_WORKER_BASE_PORT-$((SANDBOX_WORKER_BASE_PORT + NUM_WORKERS - 1)))..."
 START_SPAWN=$(date +%s)
+CONFLICT_COUNT=0
 
 for i in $(seq 1 $NUM_WORKERS); do
     port=$((SANDBOX_WORKER_BASE_PORT + i - 1))
+
+    # Try up to MAX_STARTUP_RETRIES offsets if the port is occupied
+    for retry in $(seq 0 $MAX_STARTUP_RETRIES); do
+        if port_is_free $port; then
+            break
+        fi
+        CONFLICT_COUNT=$((CONFLICT_COUNT + 1))
+        port=$((port + PORT_INCREMENT))
+        echo "[$_H] Port conflict on worker $i, trying port $port"
+    done
+
     result=$(start_worker_fast $i $port)
     WORKER_PIDS[$((i - 1))]="${result%%:*}"
     ACTUAL_WORKER_PORTS[$((i - 1))]=$port
 done
 
-echo "[$_H] All $NUM_WORKERS workers spawned in $(($(date +%s) - START_SPAWN))s"
-
-# Phase 2: Retry workers that failed due to port conflicts
-retry_round=0
-while [ $retry_round -lt $MAX_STARTUP_RETRIES ]; do
-    sleep 1
-
-    FAILED_WORKERS=()
-    for i in $(seq 1 $NUM_WORKERS); do
-        idx=$((i - 1))
-        worker_is_alive "${WORKER_PIDS[$idx]}" && continue
-        worker_had_port_conflict $i && FAILED_WORKERS+=($i)
-    done
-
-    [ ${#FAILED_WORKERS[@]} -eq 0 ] && break
-
-    PORT_OFFSET=$(( (retry_round + 1) * PORT_INCREMENT ))
-    echo "[$_H] Retry $((retry_round + 1)): ${#FAILED_WORKERS[@]} port conflicts, offset +$PORT_OFFSET"
-
-    for i in "${FAILED_WORKERS[@]}"; do
-        idx=$((i - 1))
-        new_port=$((SANDBOX_WORKER_BASE_PORT + i - 1 + PORT_OFFSET))
-        result=$(start_worker_fast $i $new_port)
-        WORKER_PIDS[$idx]="${result%%:*}"
-        ACTUAL_WORKER_PORTS[$idx]=$new_port
-    done
-
-    retry_round=$((retry_round + 1))
-done
-
-[ $retry_round -ge $MAX_STARTUP_RETRIES ] && echo "WARNING: Max startup retries reached"
+echo "[$_H] All $NUM_WORKERS workers spawned in $(($(date +%s) - START_SPAWN))s ($CONFLICT_COUNT port conflicts resolved)"
 
 # =============================================================================
 # Wait for local workers to be ready (parallel health checks)
@@ -623,8 +586,8 @@ fi
 # Network blocking
 # =============================================================================
 # ld.so.preload intercepts socket() in all NEW exec'd processes. This is safe
-# for nginx/uWSGI that are already running. However, if the monitoring loop
-# restarts a crashed worker, the new uWSGI process would be unable to bind its
+# for nginx/gunicorn that are already running. However, if the monitoring loop
+# restarts a crashed worker, the new gunicorn process would be unable to bind its
 # listening socket. We set NETWORK_BLOCKING_ACTIVE so the monitoring loop can
 # emit a clear diagnostic when this happens.
 NETWORK_BLOCKING_ACTIVE=0
@@ -658,7 +621,7 @@ else
     echo "  Proxy: localhost:$NGINX_PORT -> $MASTER_NODE:$NGINX_PORT"
     echo "  Local workers: $NUM_WORKERS (ports ${ACTUAL_WORKER_PORTS[0]}-${ACTUAL_WORKER_PORTS[$((NUM_WORKERS-1))]})"
 fi
-echo "  uWSGI: processes=$UWSGI_PROCESSES cheaper=${UWSGI_CHEAPER:-disabled}"
+echo "  Gunicorn: workers=$GUNICORN_WORKERS"
 
 # =============================================================================
 # Monitoring loop
@@ -695,7 +658,7 @@ while true; do
         fi
     done
 
-    if ! pgrep nginx > /dev/null; then
+    if ! kill -0 "$(cat /run/nginx.pid 2>/dev/null)" 2>/dev/null; then
         echo "[$_H] ERROR: Nginx died unexpectedly"
         cleanup
         exit 1

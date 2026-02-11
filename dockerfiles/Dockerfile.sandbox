@@ -27,14 +27,16 @@
 #         --python-version 3.10 -o requirements/sandbox.lock
 # =============================================================================
 
-# Use the base image with Python 3.10 and Flask
-FROM tiangolo/uwsgi-nginx-flask:python3.10
+FROM python:3.10-slim
 
-# Install dependencies required for Lean 4, pypy3, and other tools
+# Install system dependencies: nginx, build tools for pypy3/lean4/block_network
 ARG TARGETARCH
 RUN apt-get update && \
-    apt-get install -y curl git net-tools bzip2 build-essential libseccomp-dev && \
-    ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
+    apt-get install -y nginx curl git net-tools bzip2 build-essential libseccomp-dev && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# Install PyPy3
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
     case "$ARCH" in \
         amd64) PYPY_ARCH=linux64 ;; \
         arm64|aarch64) PYPY_ARCH=aarch64 ;; \
@@ -45,8 +47,7 @@ RUN apt-get update && \
     tar -xjf /tmp/pypy.tar.bz2 -C /opt/ && \
     ln -s /opt/pypy3.10-v7.3.17-$PYPY_ARCH/bin/pypy3 /usr/bin/pypy3 && \
     /usr/bin/pypy3 -m ensurepip && \
-    rm /tmp/pypy.tar.bz2 && \
-    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+    rm /tmp/pypy.tar.bz2
 
 # Install Lean 4 toolchain
 RUN curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y && \
@@ -148,21 +149,5 @@ RUN chmod +x /start-with-nginx.sh
 
 # Environment variables for multi-worker setup
 ENV NGINX_PORT=6000
-
-# Set default port for single worker mode
-ENV LISTEN_PORT=6000
-
-# Default uwsgi configuration
-ARG UWSGI_CHEAPER
-ENV UWSGI_CHEAPER=$UWSGI_CHEAPER
-
-ARG NUM_WORKERS
-ENV NUM_WORKERS=$NUM_WORKERS
-
-ARG UWSGI_PROCESSES
-ENV UWSGI_PROCESSES=$UWSGI_PROCESSES
-
-ENV LISTEN_PORT=6000
-RUN echo "uwsgi_read_timeout 14400s;" > /etc/nginx/conf.d/custom_timeout.conf
 
 CMD ["/start-with-nginx.sh"]

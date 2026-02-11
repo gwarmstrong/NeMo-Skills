@@ -45,7 +45,7 @@ int socket(int domain, int type, int protocol) {
         real_socket = dlsym(RTLD_NEXT, "socket");
     }
 
-    /* Allow Unix domain sockets (needed for local IPC, uwsgi, etc.) */
+    /* Allow Unix domain sockets (needed for local IPC, gunicorn, etc.) */
     if (domain == AF_UNIX || domain == AF_LOCAL) {
         return real_socket(domain, type, protocol);
     }

@@ -23,9 +23,7 @@ METRICS_TYPE = "icpc"
 
 # environment variables required by this benchmark
 SANDBOX_ENV_VARS = [
-    "UWSGI_PROCESSES=1024",
-    "UWSGI_CPU_AFFINITY=8",
-    "UWSGI_CHEAPER=1023",
+    "GUNICORN_WORKERS=1024",
     "NUM_WORKERS=1",
     "STATEFUL_SANDBOX=0",
 ]

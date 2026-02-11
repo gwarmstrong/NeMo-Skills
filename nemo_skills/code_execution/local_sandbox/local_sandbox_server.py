@@ -76,7 +76,7 @@ if BLOCK_NETWORK:
 # Worker that runs inside the shell process and owns a TerminalInteractiveShell()
 def shell_worker(conn):
     # LAYER 2: Python-level socket blocking for IPython sessions
-    # The shell_worker is forked (not exec'd) from the uWSGI worker, so it does NOT
+    # The shell_worker is forked (not exec'd) from the gunicorn worker, so it does NOT
     # get the ld.so.preload library loaded. We must patch Python's socket module directly.
     # This blocks: socket.socket(), _socket.socket(), requests.get(), urllib, etc.
     if BLOCK_NETWORK:
@@ -101,6 +101,11 @@ def shell_worker(conn):
         socket_module.socket = BlockedSocket  # Blocks: import socket; socket.socket()
 
     shell = TerminalInteractiveShell()
+    # TerminalInteractiveShell installs a SIGINT handler that calls sys.exit(0)
+    # instead of raising KeyboardInterrupt when _executing is False (which is
+    # the case when run_cell is called programmatically). Restore the default
+    # handler so SIGINT raises KeyboardInterrupt and our except clause catches it.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
     try:
         while True:
             try:

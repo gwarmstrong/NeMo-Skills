@@ -51,7 +51,9 @@ def _get_dataset_module_from_cluster(cluster_config, mounted_path):
         return import_from_path(tmp_path)
 
 
-def _get_default_dataset_module(dataset, data_dir=None, cluster_config=None):
+def _get_default_dataset_module(
+    dataset, data_dir=None, cluster_config=None, extra_datasets=None, extra_datasets_type=None
+):
     """Load dataset module with cluster support.
 
     For local-only loading (no cluster_config), delegates to
@@ -59,7 +61,9 @@ def _get_default_dataset_module(dataset, data_dir=None, cluster_config=None):
     """
     if cluster_config is None or cluster_config["executor"] in (None, "none"):
         # Delegate to core for local-only loading
-        return _get_local_dataset_module(dataset, data_dir)
+        return _get_local_dataset_module(
+            dataset, data_dir, extra_datasets=extra_datasets, extra_datasets_type=extra_datasets_type
+        )
 
     is_on_cluster = False
     if data_dir is None:
@@ -89,7 +93,9 @@ def get_dataset_module(dataset, data_dir=None, cluster_config=None, extra_datase
     3. `NEMO_SKILLS_EXTRA_DATASETS` environment variable
     """
     try:
-        dataset_module, data_path, is_on_cluster = _get_default_dataset_module(dataset, data_dir, cluster_config)
+        dataset_module, data_path, is_on_cluster = _get_default_dataset_module(
+            dataset, data_dir, cluster_config, extra_datasets, extra_datasets_type
+        )
     except ModuleNotFoundError:
         try:
             dataset = dataset.replace(".", "/")

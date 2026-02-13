@@ -43,6 +43,7 @@ openai
 pyyaml
 rank_bm25 # Needed for BFCLv4
 requests
+rich
 sacrebleu
 scikit-learn
 sentence_transformers # Needed for BFCLv4 

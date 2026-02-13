@@ -57,7 +57,7 @@ def _get_default_dataset_module(dataset, data_dir=None, cluster_config=None):
     For local-only loading (no cluster_config), delegates to
     nemo_skills.dataset.utils.get_dataset_module.
     """
-    if cluster_config is None or cluster_config.get("executor") in (None, "none"):
+    if cluster_config is None or cluster_config["executor"] in (None, "none"):
         # Delegate to core for local-only loading
         return _get_local_dataset_module(dataset, data_dir)
 

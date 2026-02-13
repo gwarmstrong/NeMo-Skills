@@ -103,17 +103,18 @@ def register_evaluator(eval_type: str, eval_fn: Callable[[Dict[str, Any]], None]
     if is_evaluator_registered(eval_type):
         raise ValueError(f"Evaluator for {eval_type} already registered")
 
-    _EVALUATOR_MAP_PATHS[eval_type] = None
+    _EVALUATOR_MAP_PATHS[eval_type] = "<dynamically-registered>"
     _resolved_evaluator_map[eval_type] = eval_fn
 
 
 def get_evaluator_class(eval_type: str, config: Dict[str, Any]) -> BaseEvaluator:
     """Get evaluator instance by type."""
     if eval_type not in _EVALUATOR_CLASS_MAP_PATHS:
+        all_types = sorted(list(_EVALUATOR_CLASS_MAP_PATHS.keys()) + list(_EVALUATOR_MAP_PATHS.keys()))
         raise ValueError(
             f"Evaluator class not found for type: {eval_type}.\n"
             f"Available types with class support: {list(_EVALUATOR_CLASS_MAP_PATHS.keys())}\n"
-            f"All supported types: {list(_EVALUATOR_MAP_PATHS.keys())}"
+            f"All supported types: {all_types}"
         )
 
     evaluator_class = _get_evaluator_cls(eval_type)
@@ -134,7 +135,6 @@ def evaluate(eval_type, eval_config):
     # Check if it's a class-based evaluator first
     if eval_type in _EVALUATOR_CLASS_MAP_PATHS:
         evaluator = get_evaluator_class(eval_type, eval_config)
-        print(f"evaluator: {evaluator}")
         return asyncio.run(evaluator.eval_full())
 
     # Fall back to function-based evaluator

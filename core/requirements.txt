@@ -1,0 +1,27 @@
+# Core dependencies for agent runtime (inference, evaluation, tool calling, math/code grading).
+# No cluster orchestration deps (nemo_run, typer, etc.)
+
+
+# --- code evaluation ---
+compute-eval @ git+https://github.com/NVIDIA/compute-eval.git@2d14770
+evalplus @ git+https://github.com/evalplus/evalplus@c91370f
+fire
+flask
+# --- agent runtime ---
+httpx
+huggingface_hub
+hydra-core
+ipython
+litellm[caching]
+
+# --- math evaluation ---
+math-verify[antlr4_9_3]
+mcp
+numpy
+openai
+pyyaml
+requests
+rich
+sympy
+tqdm
+transformers

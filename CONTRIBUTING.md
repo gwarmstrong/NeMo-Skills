@@ -49,6 +49,49 @@ The following things are required when adding new benchmarks
   the dataset into slurm tests. This is the most comprehensive test we can do by running full
   evaluation on cluster with arbitrary model and check that results are as expected.
 
+### Respect the Core / Pipeline dependency boundary
+
+NeMo Skills is split into **Core** (agent runtime) and **Pipeline** (orchestration). The rule is simple:
+
+```
+Pipeline can import from Core.
+Core CANNOT import from Pipeline.
+```
+
+Core modules are everything under `nemo_skills/` **except** `nemo_skills/pipeline/`. They must never have top-level imports from `nemo_skills.pipeline` or `nemo_run`. This boundary is enforced by `tests/test_dependency_isolation.py` which verifies that core modules import successfully without pipeline dependencies installed.
+
+**When adding a new dependency**, put it in the right requirements file:
+
+| If the dependency is needed for... | Add it to |
+|---|---|
+| Inference, evaluation, math/code grading, MCP clients, prompt formatting | `core/requirements.txt` |
+| CLI commands, cluster orchestration, experiment tracking | `requirements/pipeline.txt` |
+| Everything else (dataset-specific deps, benchmark-specific packages) | `requirements/main.txt` only |
+
+Dependencies in `core/requirements.txt` should be things that a typical `GenerationTask` run with PythonTool would need. Dataset-specific or benchmark-specific packages (e.g., `faiss-cpu`, `sacrebleu`, `func-timeout`) go only in `requirements/main.txt`.
+
+All core and pipeline deps must also appear in `requirements/main.txt` (the monolithic file used for default installs).
+
+**Examples of correct placement:**
+
+- `httpx` -> `core/requirements.txt` (used by model inference clients)
+- `sympy` -> `core/requirements.txt` (used by math graders)
+- `nemo_run` -> `requirements/pipeline.txt` (cluster job orchestration)
+- `wandb` -> `requirements/pipeline.txt` (experiment tracking for cluster jobs)
+- `faiss-cpu` -> `requirements/main.txt` only (only needed for BFCL benchmark)
+
+**Examples of mistakes to avoid:**
+
+- Adding `nemo_run` to `core/requirements.txt` -- it is a pipeline/orchestration dependency, core must not depend on it.
+- Adding `typer` to `core/requirements.txt` -- it is the CLI framework, only used by the pipeline layer.
+- Adding a new dependency only to a subpackage file but forgetting `requirements/main.txt` -- the default install would be missing it.
+
+**When writing new core code:**
+
+- If you need something from `nemo_skills.pipeline`, your code probably belongs in pipeline, not core. Move it.
+- If you have a function that works locally but *also* needs a cluster variant, put the local version in core and a cluster-aware wrapper in `nemo_skills/pipeline/` (see `pipeline/dataset.py` for the pattern).
+- If you absolutely must reference pipeline code from core for backwards compatibility, use a lazy import inside a function body with a `DeprecationWarning` (see `dataset/utils.py:get_dataset_module` for the pattern). Never add a top-level import.
+
 ### Keep the code elegant
 When adding new features, try to keep the code simple and elegant.
 - Can you reuse / extend an existing functionality?

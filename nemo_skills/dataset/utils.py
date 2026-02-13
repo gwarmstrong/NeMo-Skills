@@ -17,16 +17,15 @@ import importlib
 import json
 import os
 import sys
-import tempfile
 import time
 import urllib.request
+import warnings
 from enum import Enum
 from pathlib import Path
 from typing import Dict
 from urllib.error import URLError
 
 from nemo_skills.evaluation.math_grader import extract_answer
-from nemo_skills.pipeline.utils import cluster_download_file, get_unmounted_path
 
 
 @contextlib.contextmanager
@@ -72,80 +71,68 @@ class ExtraDatasetType(str, Enum):
     cluster = "cluster"
 
 
-def _get_dataset_module_from_cluster(cluster_config, mounted_path):
-    # getting tmp path to download init.py
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = str(Path(tmpdir) / "init.py")
-        cluster_dataset_path = get_unmounted_path(cluster_config, mounted_path)
-        try:
-            cluster_download_file(cluster_config, cluster_dataset_path, tmp_path)
-        except FileNotFoundError:
-            raise RuntimeError(
-                f"Init file {mounted_path} not found on the cluster. "
-                f"Please check the dataset name you're using. Did you forget to run prepare data commands?"
-            )
-        return import_from_path(tmp_path)
-
-
-def get_default_dataset_module(dataset, data_dir=None, cluster_config=None):
-    is_on_cluster = False
-    if data_dir is None:
-        data_path = "/nemo_run/code/nemo_skills/dataset"
-        dataset_module = importlib.import_module(f"nemo_skills.dataset.{dataset}")
-    else:
-        data_path = data_dir
-        if cluster_config is None or cluster_config["executor"] == "none":
-            with add_to_path(data_dir):
-                dataset_module = importlib.import_module(dataset)
-        else:
-            if cluster_config["executor"] == "local":
-                with add_to_path(get_unmounted_path(cluster_config, data_dir)):
-                    dataset_module = importlib.import_module(dataset)
-            else:
-                dataset = dataset.replace(".", "/")
-                dataset_module = _get_dataset_module_from_cluster(cluster_config, f"{data_dir}/{dataset}/__init__.py")
-                is_on_cluster = True
-    return dataset_module, data_path, is_on_cluster
-
-
 def get_dataset_module(dataset, data_dir=None, cluster_config=None, extra_datasets=None, extra_datasets_type=None):
-    """
-    Get dataset module either in default folder or in extra datasets folder.
+    """Load dataset module from the local filesystem.
 
-    If cluster_config is provided, the data_dir will be resolved as a mounted
-    path and appropriately downloaded from the cluster.
-
-    Same will be done for extra_datasets if extra_datasets_type is cluster.
+    For loading datasets from a remote cluster, use
+    nemo_skills.pipeline.dataset.get_dataset_module instead.
 
     Search priority:
-    1. data_dir (or `nemo_skills.dataset` if None) folder
-    3. extra_datasets parameter if defined
-    4. `NEMO_SKILLS_EXTRA_DATASETS` environment variable
+    1. data_dir (or ``nemo_skills.dataset`` if None) folder
+    2. extra_datasets parameter if defined
+    3. ``NEMO_SKILLS_EXTRA_DATASETS`` environment variable
+
+    Args:
+        dataset: Name of the dataset (e.g., "gsm8k", "math").
+        data_dir: Optional custom directory containing dataset module.
+        cluster_config: Deprecated. Use nemo_skills.pipeline.dataset.get_dataset_module for cluster support.
+        extra_datasets: Optional path to extra datasets.
+        extra_datasets_type: Type of extra datasets location ("local" or "cluster").
+
+    Returns:
+        Tuple of (dataset_module, data_path, is_on_cluster).
     """
+    if cluster_config is not None:
+        warnings.warn(
+            "Passing cluster_config to nemo_skills.dataset.utils.get_dataset_module is deprecated. "
+            "Use nemo_skills.pipeline.dataset.get_dataset_module instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from nemo_skills.pipeline.dataset import get_dataset_module as _pipeline_get_dataset_module
+
+        return _pipeline_get_dataset_module(dataset, data_dir, cluster_config, extra_datasets, extra_datasets_type)
+
+    # Local-only loading
     try:
-        dataset_module, data_path, is_on_cluster = get_default_dataset_module(dataset, data_dir, cluster_config)
+        if data_dir is None:
+            data_path = "/nemo_run/code/nemo_skills/dataset"
+            dataset_module = importlib.import_module(f"nemo_skills.dataset.{dataset}")
+        else:
+            data_path = data_dir
+            with add_to_path(data_dir):
+                dataset_module = importlib.import_module(dataset)
+        return dataset_module, data_path, False
     except ModuleNotFoundError:
-        try:
-            dataset = dataset.replace(".", "/")
-            extra_datasets = extra_datasets or os.environ.get("NEMO_SKILLS_EXTRA_DATASETS")
-            is_on_cluster = False
-            data_path = extra_datasets
-            if extra_datasets is None:
-                raise RuntimeError(f"Dataset {dataset} not found in {data_dir if data_dir else 'nemo_skills.dataset'}")
-            if extra_datasets_type == ExtraDatasetType.local:
-                with add_to_path(extra_datasets):
+        dataset = dataset.replace(".", "/")
+        extra_datasets = extra_datasets or os.environ.get("NEMO_SKILLS_EXTRA_DATASETS")
+        if extra_datasets is None:
+            raise RuntimeError(f"Dataset {dataset} not found in {data_dir if data_dir else 'nemo_skills.dataset'}")
+        if extra_datasets_type == ExtraDatasetType.local or extra_datasets_type is None:
+            with add_to_path(extra_datasets):
+                try:
                     dataset_module = importlib.import_module(dataset)
-            else:
-                dataset_module = _get_dataset_module_from_cluster(
-                    cluster_config, f'{extra_datasets}/{dataset}/"__init__.py"'
-                )
-                is_on_cluster = True
-        except ModuleNotFoundError:
+                except ModuleNotFoundError:
+                    raise RuntimeError(
+                        f"Dataset {dataset} not found in any of the searched locations: "
+                        f"{data_dir if data_dir else 'nemo_skills.dataset'}, {extra_datasets}"
+                    )
+            return dataset_module, extra_datasets, False
+        else:
             raise RuntimeError(
-                f"Dataset {dataset} not found in any of the searched locations: "
-                f"{data_dir if data_dir else 'nemo_skills.dataset'}, {extra_datasets}"
+                f"Cluster-based extra_datasets_type='{extra_datasets_type}' requires cluster_config. "
+                "Use nemo_skills.pipeline.dataset.get_dataset_module instead."
             )
-    return dataset_module, data_path, is_on_cluster
 
 
 def get_lean4_header():

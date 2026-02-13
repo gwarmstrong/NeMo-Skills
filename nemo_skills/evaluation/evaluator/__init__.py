@@ -103,7 +103,7 @@ def register_evaluator(eval_type: str, eval_fn: Callable[[Dict[str, Any]], None]
     if is_evaluator_registered(eval_type):
         raise ValueError(f"Evaluator for {eval_type} already registered")
 
-    _EVALUATOR_MAP_PATHS[eval_type] = "<dynamically-registered>"
+    _EVALUATOR_MAP_PATHS[eval_type] = None
     _resolved_evaluator_map[eval_type] = eval_fn
 
 

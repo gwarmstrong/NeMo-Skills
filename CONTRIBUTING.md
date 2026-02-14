@@ -64,33 +64,39 @@ Core modules are everything under `nemo_skills/` **except** `nemo_skills/pipelin
 
 | If the dependency is needed for... | Add it to |
 |---|---|
-| Inference, evaluation, math/code grading, MCP clients, prompt formatting | `core/requirements.txt` |
-| CLI commands, cluster orchestration, experiment tracking | `requirements/pipeline.txt` |
-| Everything else (dataset-specific deps, benchmark-specific packages) | `requirements/main.txt` only |
+| Inference, evaluation, tool calling, any benchmark evaluator | `core/requirements.txt` |
+| CLI commands (`ns`), cluster orchestration, experiment tracking | `requirements/pipeline.txt` |
 
-Dependencies in `core/requirements.txt` should be things that a typical `GenerationTask` run with PythonTool would need. Dataset-specific or benchmark-specific packages (e.g., `faiss-cpu`, `sacrebleu`, `func-timeout`) go only in `requirements/main.txt`.
+There is no separate `main.txt` — `pyproject.toml` composes the default install from `core/requirements.txt` + `requirements/pipeline.txt`. Each dependency lives in exactly one file.
 
-All core and pipeline deps must also appear in `requirements/main.txt` (the monolithic file used for default installs).
+**Boundary definition:**
+
+- **Core** = everything needed to run inference + evaluation locally (including all benchmark evaluator deps)
+- **Pipeline** = orchestration-only deps (`nemo_run`, `typer`, `wandb`, `click`, `nemo-evaluator-launcher`)
+
+All benchmark-specific dependencies (e.g., `faiss-cpu`, `sacrebleu`, `datasets`, `func-timeout`) go in `core/requirements.txt`. Eventually these should migrate to JIT (just-in-time) install so that benchmark deps are installed on demand at runtime, but until that is implemented, they must be in core so evaluators do not crash at runtime.
 
 **Examples of correct placement:**
 
 - `httpx` -> `core/requirements.txt` (used by model inference clients)
 - `sympy` -> `core/requirements.txt` (used by math graders)
+- `sacrebleu` -> `core/requirements.txt` (used by translation benchmark evaluator)
+- `faiss-cpu` -> `core/requirements.txt` (used by BFCL benchmark evaluator)
 - `nemo_run` -> `requirements/pipeline.txt` (cluster job orchestration)
 - `wandb` -> `requirements/pipeline.txt` (experiment tracking for cluster jobs)
-- `faiss-cpu` -> `requirements/main.txt` only (only needed for BFCL benchmark)
 
 **Examples of mistakes to avoid:**
 
 - Adding `nemo_run` to `core/requirements.txt` -- it is a pipeline/orchestration dependency, core must not depend on it.
 - Adding `typer` to `core/requirements.txt` -- it is the CLI framework, only used by the pipeline layer.
-- Adding a new dependency only to a subpackage file but forgetting `requirements/main.txt` -- the default install would be missing it.
 
 **When writing new core code:**
 
 - If you need something from `nemo_skills.pipeline`, your code probably belongs in pipeline, not core. Move it.
-- If you have a function that works locally but *also* needs a cluster variant, put the local version in core and a cluster-aware wrapper in `nemo_skills/pipeline/` (see `pipeline/dataset.py` for the pattern).
+- If you have a function that works locally but *also* needs a cluster variant, put the local version in core and a cluster-aware wrapper in `nemo_skills/pipeline/` (see `pipeline/dataset.py` for the pattern). The pipeline wrapper should **only** handle cluster I/O (SSH downloads, mount resolution), then delegate to core for all local logic.
 - If you absolutely must reference pipeline code from core for backwards compatibility, use a lazy import inside a function body with a `DeprecationWarning` (see `dataset/utils.py:get_dataset_module` for the pattern). Never add a top-level import.
+
+> **Note:** `summarize-results` currently straddles core and pipeline (it downloads files from the cluster and processes them locally). A clean separation is tracked in [issue #779](https://github.com/NVIDIA-NeMo/Skills/issues/779#issuecomment-3344395623).
 
 ### Keep the code elegant
 When adding new features, try to keep the code simple and elegant.

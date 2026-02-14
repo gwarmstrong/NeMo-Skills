@@ -54,7 +54,7 @@ exclude = ["tests", "tests.*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "nemo_skills.version.__version__" }
-dependencies = {file = ["requirements/main.txt"]}
+dependencies = {file = ["core/requirements.txt", "requirements/pipeline.txt"]}
 
 [tool.setuptools.dynamic.optional-dependencies]
 # Core: lightweight runtime only (inference, evaluation, tool calling)

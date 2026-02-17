@@ -96,8 +96,6 @@ All benchmark-specific dependencies (e.g., `faiss-cpu`, `sacrebleu`, `datasets`,
 - If you have a function that works locally but *also* needs a cluster variant, put the local version in core and a cluster-aware wrapper in `nemo_skills/pipeline/` (see `pipeline/dataset.py` for the pattern). The pipeline wrapper should **only** handle cluster I/O (SSH downloads, mount resolution), then delegate to core for all local logic.
 - If you absolutely must reference pipeline code from core for backwards compatibility, use a lazy import inside a function body with a `DeprecationWarning` (see `dataset/utils.py:get_dataset_module` for the pattern). Never add a top-level import.
 
-> **Note:** `summarize-results` currently straddles core and pipeline (it downloads files from the cluster and processes them locally). A clean separation is tracked in [issue #779](https://github.com/NVIDIA-NeMo/Skills/issues/779#issuecomment-3344395623).
-
 ### Keep the code elegant
 When adding new features, try to keep the code simple and elegant.
 - Can you reuse / extend an existing functionality?

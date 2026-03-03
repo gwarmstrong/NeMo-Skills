@@ -638,7 +638,7 @@ class Pipeline:
         # Allow per-command extra mounts without requiring editing the cluster YAML.
         # We treat exec_config["mounts"] as additive and merge it with mounts from cluster_config.
         mounts = None
-        extra_mounts = exec_config.get("mounts") or None
+        extra_mounts = exec_config["mounts"] or None
         if extra_mounts:
             base_mounts = get_mounts_from_config(cluster_config)
             mounts = base_mounts + [m for m in extra_mounts if m not in base_mounts]
@@ -760,7 +760,7 @@ class Pipeline:
         shared_packager = None
 
         # Build commands and executors using prepared data
-        for entry in prepared_commands:
+        for entry_idx, entry in enumerate(prepared_commands):
             het_idx = entry["het_idx"]
             comp_idx = entry["comp_idx"]
             group = entry["group"]
@@ -778,8 +778,10 @@ class Pipeline:
 
             # Resolve container and create executor
             container_image = self._resolve_container(exec_config, command, cluster_config)
-            # Pass external dependencies only to the first executor (SLURM doesn't support per-component dependencies in hetjobs)
-            exec_dependencies = external_deps if (het_idx == 0 and comp_idx == 0) else None
+            # Pass external dependencies only to the first executor in iteration order.
+            # We use entry_idx rather than het_idx/comp_idx because prepared_commands may
+            # have been reordered (e.g., to put spanning components first for allocation).
+            exec_dependencies = external_deps if entry_idx == 0 else None
 
             # Always use group.name for SLURM job name (consistent across all components)
             # The group name is set to task_name in generate.py, without component suffixes

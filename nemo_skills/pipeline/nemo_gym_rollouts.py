@@ -42,7 +42,7 @@ Example usage:
         --config_paths "ns_tools/configs/ns_tools.yaml" \\
         --input_file data/example.jsonl \\
         --output_dir /results/rollouts \\
-        --server_address http://localhost:8000/v1 \\
+        --model http://localhost:8000/v1 \\
         --policy_model_name nvidia/model-name \\
         +agent_name=ns_tools_simple_agent
 """
@@ -66,7 +66,7 @@ from nemo_skills.pipeline.utils.scripts import (
     SandboxScript,
     ServerScript,
 )
-from nemo_skills.utils import get_logger_name, setup_logging
+from nemo_skills.utils import get_logger_name, setup_logging, str_ids_to_list
 
 LOG = logging.getLogger(get_logger_name(__file__))
 
@@ -88,10 +88,9 @@ def nemo_gym_rollouts(
     input_file: str = typer.Option(..., help="Path to input JSONL file for rollout collection"),
     output_dir: str = typer.Option(..., help="Directory for rollout outputs. Output file will be rollouts.jsonl"),
     expname: str = typer.Option("nemo_gym_rollouts", help="NeMo Run experiment name"),
-    model: str = typer.Option(None, help="Path to model for self-hosted vLLM server"),
-    server_address: str = typer.Option(
+    model: str = typer.Option(
         None,
-        help="Address of pre-hosted server (e.g., http://localhost:8000/v1). If provided, skips self-hosted server.",
+        help="Model path for self-hosted server, or server URL (e.g., http://host:8000/v1) for pre-hosted.",
     ),
     server_type: pipeline_utils.SupportedServers = typer.Option(
         None,
@@ -100,6 +99,11 @@ def nemo_gym_rollouts(
     server_gpus: int = typer.Option(None, help="Number of GPUs for self-hosted server"),
     server_nodes: int = typer.Option(1, help="Number of nodes for self-hosted server"),
     server_args: str = typer.Option("", help="Additional arguments for the server"),
+    server_container: str = typer.Option(
+        None,
+        help="Override the container image for the server. "
+        "If not specified, uses cluster_config['containers'][server_type].",
+    ),
     with_sandbox: bool = typer.Option(False, help="If True, start a sandbox container for code execution"),
     gym_path: str = typer.Option(
         "/opt/NeMo-RL/3rdparty/Gym-workspace/Gym",
@@ -180,28 +184,27 @@ def nemo_gym_rollouts(
     config_paths_list = [p.strip() for p in config_paths.split(",") if p.strip()]
     LOG.info(f"Config paths: {config_paths_list}")
 
-    # Validate server configuration
-    self_hosted = model is not None and server_gpus is not None
-    pre_hosted = server_address is not None
+    # Determine if model is a URL (pre-hosted) or a path (self-hosted)
+    pre_hosted = model is not None and model.startswith("http")
+    self_hosted = model is not None and not pre_hosted and server_gpus is not None
+
+    if model is None:
+        raise ValueError("--model is required. Provide a model path for self-hosted or a URL for pre-hosted server.")
 
     if not self_hosted and not pre_hosted:
         raise ValueError(
-            "Must provide either --model and --server_gpus for self-hosted server, "
-            "or --server_address for pre-hosted server"
+            "--server_gpus is required when using a self-hosted server (model path). "
+            "Or provide a URL (http://...) for pre-hosted."
         )
-
-    if self_hosted and pre_hosted:
-        raise ValueError("Cannot specify both self-hosted (--model, --server_gpus) and pre-hosted (--server_address)")
 
     if self_hosted and server_type is None:
         raise ValueError("--server_type is required when using self-hosted server")
 
     # Validate and set policy_model_name
     if pre_hosted and policy_model_name is None:
-        raise ValueError("--policy_model_name is required when using a pre-hosted server (--server_address)")
+        raise ValueError("--policy_model_name is required when using a pre-hosted server")
 
     if self_hosted and policy_model_name is None:
-        # For self-hosted, default to the model path
         policy_model_name = model
         LOG.info(f"Using model path as policy_model_name: {policy_model_name}")
 
@@ -216,9 +219,8 @@ def nemo_gym_rollouts(
 
     # Determine seed indices for parallel jobs
     if random_seeds is not None:
-        # Explicit seeds provided
         if isinstance(random_seeds, str):
-            seed_indices = [int(s.strip()) for s in random_seeds.split(",")]
+            seed_indices = str_ids_to_list(random_seeds)
         else:
             seed_indices = list(random_seeds)
         LOG.info(f"Using explicit seeds: {seed_indices}")
@@ -230,12 +232,15 @@ def nemo_gym_rollouts(
     else:
         seed_indices = [None]  # Single job, no seed suffix
 
-    # Get server type string once if self-hosted
+    # Get server type string and container if self-hosted
     server_type_str = None
-    server_container = None
+    resolved_server_container = None
     if self_hosted:
         server_type_str = server_type.value if hasattr(server_type, "value") else server_type
-        server_container = cluster_config["containers"].get(server_type_str, server_type_str)
+        if server_container is not None:
+            resolved_server_container = server_container
+        else:
+            resolved_server_container = cluster_config["containers"][server_type_str]
 
     # Filter out seeds with existing output files (unless rerun_done=True)
     if not rerun_done and seed_indices != [None]:
@@ -243,15 +248,10 @@ def nemo_gym_rollouts(
         skipped_seeds = []
         for seed_idx in seed_indices:
             output_file = f"{output_dir}/rollouts-rs{seed_idx}.jsonl"
-            # Check if file exists on cluster
-            try:
-                unmounted_path = get_unmounted_path(cluster_config, output_file)
-                if cluster_path_exists(cluster_config, unmounted_path):
-                    skipped_seeds.append(seed_idx)
-                else:
-                    filtered_seeds.append(seed_idx)
-            except Exception as e:
-                LOG.warning(f"Could not check if {output_file} exists: {e}. Including seed {seed_idx}.")
+            unmounted_path = get_unmounted_path(cluster_config, output_file)
+            if cluster_path_exists(cluster_config, unmounted_path):
+                skipped_seeds.append(seed_idx)
+            else:
                 filtered_seeds.append(seed_idx)
 
         if skipped_seeds:
@@ -285,12 +285,12 @@ def nemo_gym_rollouts(
                 num_gpus=server_gpus,
                 num_nodes=server_nodes,
                 server_args=server_args,
-                allocate_port=True,  # Each job gets unique port
+                allocate_port=True,
             )
 
             server_cmd = Command(
                 script=server_script,
-                container=server_container,
+                container=resolved_server_container,
                 name=f"{expname}_server{job_suffix}",
             )
             components.append(server_cmd)
@@ -301,7 +301,7 @@ def nemo_gym_rollouts(
         if with_sandbox:
             sandbox_script = SandboxScript(
                 cluster_config=cluster_config,
-                allocate_port=True,  # Each job gets unique port
+                allocate_port=True,
             )
 
             sandbox_cmd = Command(
@@ -319,7 +319,7 @@ def nemo_gym_rollouts(
             output_file=output_file,
             extra_arguments=extra_arguments,
             server=server_script,
-            server_address=server_address,
+            server_address=model if pre_hosted else None,
             sandbox=sandbox_script,
             gym_path=gym_path,
             policy_api_key=policy_api_key,
@@ -330,7 +330,6 @@ def nemo_gym_rollouts(
             script=nemo_gym_script,
             container=cluster_config["containers"]["nemo-rl"],
             name=f"{expname}_nemo_gym{job_suffix}",
-            # If use_mounted_nemo_skills=False, avoid /nemo_run/code so Gym uses its bundled version
             avoid_nemo_run_code=not use_mounted_nemo_skills,
         )
         components.append(nemo_gym_cmd)

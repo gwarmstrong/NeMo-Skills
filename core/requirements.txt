@@ -20,10 +20,7 @@ ipython
 iso639-lang
 langcodes
 language-data
-# Keep LiteLLM in the Gym-compatible range.
-# 1.82.6 raises the floor to openai>=2.8.0, which conflicts with Gym's pinned
-# openai==2.7.2 in child server environments.
-litellm[caching]==1.77.5
+litellm[caching]==1.82.6
 math-verify[antlr4_9_3]
 mcp
 numpy

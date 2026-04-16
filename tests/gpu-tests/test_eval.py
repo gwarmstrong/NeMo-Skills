@@ -33,7 +33,7 @@ EXCLUDED_DATASETS = {
     "ruler2",
     "bigcodebench",
     "livecodebench",
-    "livebench_coding",
+    "livebench-coding",
     "livecodebench-pro",
     "livecodebench-cpp",
     "ioi",
@@ -61,6 +61,10 @@ EXCLUDED_DATASETS = {
     # SPEED-Bench downloads dozens of large external HF datasets, exhausting CI runner disk space
     "speed-bench",
     "mmmlu",  # too large
+    # Multilingual benchmarks that download many HF dataset splits (one per language)
+    "polymath",
+    "m-arena-hard",
+    "m-arena-hard-v2",
 }
 
 

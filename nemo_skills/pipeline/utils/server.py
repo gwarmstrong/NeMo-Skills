@@ -81,7 +81,19 @@ def set_python_path_and_wait_for_server(server_address, generation_commands):
     return wrap_python_path(cmd)
 
 
-def get_ray_server_cmd(start_cmd):
+def get_ray_server_cmd(start_cmd, dp_size: int | None = None):
+    """Build the Ray-cluster startup script for multi-node serving.
+
+    If ``dp_size`` is provided and < total num_nodes, workers with
+    ``SLURM_PROCID >= dp_size`` join Ray with ``--num-gpus=0`` and a
+    custom ``extra_gpu`` resource. This hides their GPUs from vLLM's
+    GPU discovery (so DP placement/coordination ignores them) while
+    still exposing a resource that opt-in Ray tasks (e.g. neural-eval
+    metrics like xCOMET) can schedule against via
+    ``@ray.remote(num_gpus=0, resources={"extra_gpu": 1})``. Such tasks
+    must also set ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` on
+    the node so physical GPUs remain visible to the task process.
+    """
     ports = (
         "--node-manager-port=12345 "
         "--object-manager-port=12346 "
@@ -93,6 +105,36 @@ def get_ray_server_cmd(start_cmd):
         "--max-worker-port=18349 "
     )
 
+    if dp_size is not None:
+        # Worker branch: split on whether this rank participates in DP.
+        worker_branch = (
+            'if [ "${SLURM_PROCID:-0}" -lt ' + str(dp_size) + " ]; then "
+            "    echo 'Starting DP worker node' && "
+            "    ray start "
+            "        --block "
+            "        --address=$SLURM_MASTER_NODE:6379 "
+            f"       {ports} ;"
+            "else "
+            "    echo 'Starting extra worker node (GPUs hidden from vLLM)' && "
+            "    export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 && "
+            "    ray start "
+            "        --block "
+            "        --address=$SLURM_MASTER_NODE:6379 "
+            "        --num-gpus=0 "
+            "        --resources='{\"extra_gpu\": 8}' "
+            f"       {ports} ;"
+            "fi"
+        )
+    else:
+        worker_branch = (
+            "    echo 'Starting worker node' && "
+            '    echo "Connecting to head node at $SLURM_MASTER_NODE" && '
+            "    ray start "
+            "        --block "
+            "        --address=$SLURM_MASTER_NODE:6379 "
+            f"       {ports} ;"
+        )
+
     ray_start_cmd = (
         'if [ "${SLURM_PROCID:-0}" = 0 ]; then '
         "    echo 'Starting head node' && "
@@ -103,13 +145,8 @@ def get_ray_server_cmd(start_cmd):
         f"       {ports} && "
         f"   {start_cmd} ; "
         "else "
-        "    echo 'Starting worker node' && "
         "    export RAY_raylet_start_wait_time_s=120 && "
-        '    echo "Connecting to head node at $SLURM_MASTER_NODE" && '
-        "    ray start "
-        "        --block "
-        "        --address=$SLURM_MASTER_NODE:6379 "
-        f"       {ports} ;"
+        f"   {worker_branch} "
         "fi"
     )
     return ray_start_cmd
@@ -192,10 +229,21 @@ def get_server_command(
             f"    --port {server_port} "
             f"    {server_args} "
         )
+        # Parse --data-parallel-size out of server_args so Ray can start
+        # extra (non-DP) workers with --num-gpus=0 + extra_gpu custom
+        # resource. This hides their GPUs from vLLM's discovery (so DP
+        # placement-group + compiled-DAG coordination don't trip over
+        # an untracked idle node) while keeping them reachable for
+        # opt-in Ray tasks like xCOMET scoring.
+        import re
+
+        dp_match = re.search(r"(?:^|\s)--?data[-_]parallel[-_]size[= ](\d+)", server_args or "")
+        dp_size = int(dp_match.group(1)) if dp_match else num_nodes
+
         # Ray must be started externally for this path: the wrapper calls
         # ray.init(address="auto") and relies on an already-running cluster
         # so it can pre-reserve DP rank 0's PG before vLLM boots.
-        server_start_cmd = get_ray_server_cmd(start_vllm_cmd)
+        server_start_cmd = get_ray_server_cmd(start_vllm_cmd, dp_size=dp_size)
         num_tasks = 1
     elif server_type == "sglang":
         if num_nodes > 1:

@@ -24,6 +24,7 @@ LOG = logging.getLogger(get_logger_name(__file__))
 class SupportedServersSelfHosted(str, Enum):
     trtllm = "trtllm"
     vllm = "vllm"
+    vllm_dp_ray = "vllm_dp_ray"
     vllm_multimodal = "vllm_multimodal"
     sglang = "sglang"
     megatron = "megatron"
@@ -33,6 +34,7 @@ class SupportedServersSelfHosted(str, Enum):
 class SupportedServers(str, Enum):
     trtllm = "trtllm"
     vllm = "vllm"
+    vllm_dp_ray = "vllm_dp_ray"
     vllm_multimodal = "vllm_multimodal"
     sglang = "sglang"
     megatron = "megatron"
@@ -175,6 +177,25 @@ def get_server_command(
             server_start_cmd = get_ray_server_cmd(start_vllm_cmd)
         else:
             server_start_cmd = start_vllm_cmd
+        num_tasks = 1
+    elif server_type == "vllm_dp_ray":
+        # Same interface as `vllm`, but starts vLLM in-process on the Ray head
+        # so NeMo Gym's DP-on-Ray placement-group monkey-patch takes effect.
+        # Required when total Ray nodes > data_parallel_size (e.g. an extra
+        # node reserved for a Ray-scheduled neural-eval task).
+        server_entrypoint = server_entrypoint or "-m nemo_skills.inference.server.serve_vllm_dp_ray"
+        start_vllm_cmd = (
+            f"python3 {server_entrypoint} "
+            f"    --model {model_path} "
+            f"    --num_gpus {num_gpus} "
+            f"    --num_nodes {num_nodes} "
+            f"    --port {server_port} "
+            f"    {server_args} "
+        )
+        # Ray must be started externally for this path: the wrapper calls
+        # ray.init(address="auto") and relies on an already-running cluster
+        # so it can pre-reserve DP rank 0's PG before vLLM boots.
+        server_start_cmd = get_ray_server_cmd(start_vllm_cmd)
         num_tasks = 1
     elif server_type == "sglang":
         if num_nodes > 1:

@@ -411,6 +411,27 @@ def main() -> None:
 
     ray.init(address="auto" if args.num_nodes > 1 else None, ignore_reinit_error=True)
 
+    # DP=1 takes a different code path inside vLLM: the ray_executor
+    # calls ``initialize_ray_cluster`` directly and creates its own PGs
+    # from whatever GPUs are free on the cluster. That path does NOT use
+    # ``CoreEngineActorManager.create_dp_placement_groups``, so our
+    # monkey-patch wouldn't activate — and pre-reserving a head PG here
+    # would just steal the GPUs vLLM is about to ask for (the engine
+    # then errors with "Current node has no GPU available").
+    #
+    # For DP=1 we therefore skip the reservation + patches entirely and
+    # let vLLM drive. The extra-node hiding (if any) was already applied
+    # at ``ray start`` time by ``get_ray_server_cmd`` and doesn't need
+    # our help here.
+    if dp_size == 1:
+        print("[serve_vllm_dp_ray] dp_size=1: deferring to vLLM's native ray_executor path")
+        _patch_signal_for_thread_safety()
+        from vllm.entrypoints.openai.api_server import run_server
+
+        print(f"[serve_vllm_dp_ray] vLLM argv: {shlex.join(sys.argv[1:])}")
+        asyncio.run(run_server(vllm_args))
+        return
+
     # ------------------------------------------------------------------------------
     # Reserve DP rank 0's placement group on THIS node and set
     # VLLM_DP_MASTER_IP so DP engines find the coordinator.
@@ -436,12 +457,6 @@ def main() -> None:
 
     from vllm.entrypoints.openai.api_server import run_server
 
-    # Optional pipe-through for log filtering — default path leaves
-    # stdout untouched; callers who want the " | grep -v '200 OK' "
-    # behaviour from serve_vllm.py should use --no_verbose + vLLM's
-    # --disable-log-requests instead (cleaner than a shell pipe here).
-
-    # Keep argv printable for debugging.
     print(f"[serve_vllm_dp_ray] vLLM argv: {shlex.join(sys.argv[1:])}")
 
     asyncio.run(run_server(vllm_args))

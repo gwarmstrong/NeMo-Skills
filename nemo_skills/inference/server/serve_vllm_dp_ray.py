@@ -321,6 +321,11 @@ def _build_vllm_argv(args: argparse.Namespace, extra: Sequence[str]) -> list[str
     ``num_gpus × num_nodes`` because the vllm_dp_ray topology
     (DP replicas × TP/PP per replica × extra Ray-only nodes) cannot be
     derived from that product alone.
+
+    We do inject ``--distributed-executor-backend=ray`` when the user hasn't
+    specified it — the whole point of this entrypoint is Ray-based DP/TP
+    coordination, and vLLM defaults to mp backend which then rejects any
+    ``world_size > num_gpus_per_node`` config.
     """
     argv = [
         f"--model={args.model}",
@@ -331,6 +336,11 @@ def _build_vllm_argv(args: argparse.Namespace, extra: Sequence[str]) -> list[str
     ]
     if args.no_verbose:
         argv.extend(["--disable-log-requests", "--disable-log-stats"])
+    has_backend = any(
+        tok == "--distributed-executor-backend" or tok.startswith("--distributed-executor-backend=") for tok in extra
+    )
+    if not has_backend:
+        argv.append("--distributed-executor-backend=ray")
     argv.extend(extra)
     return argv
 

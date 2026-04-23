@@ -341,6 +341,18 @@ def _build_vllm_argv(args: argparse.Namespace, extra: Sequence[str]) -> list[str
     )
     if not has_backend:
         argv.append("--distributed-executor-backend=ray")
+    has_dp_local = any(
+        tok in ("--data-parallel-size-local", "--data_parallel_size_local")
+        or tok.startswith("--data-parallel-size-local=")
+        or tok.startswith("--data_parallel_size_local=")
+        for tok in extra
+    )
+    if not has_dp_local:
+        # serve_vllm_dp_ray places each DP replica on its own node(s); vLLM
+        # otherwise defaults data_parallel_size_local to data_parallel_size,
+        # which packs all replicas onto the coordinator's node and then
+        # tries to advertise GPU indices it doesn't have.
+        argv.append("--data-parallel-size-local=1")
     argv.extend(extra)
     return argv
 

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import shlex
 from enum import Enum
 
 from nemo_skills.pipeline.utils.mounts import check_if_mounted
@@ -81,18 +82,89 @@ def set_python_path_and_wait_for_server(server_address, generation_commands):
     return wrap_python_path(cmd)
 
 
-def get_ray_server_cmd(start_cmd, dp_size: int | None = None):
+def _parse_last_flag(tokens: list[str], *names: str) -> str | None:
+    """Return the last matched value for any of the given CLI flag names.
+
+    Accepts both ``--flag value`` and ``--flag=value`` forms. Searches left
+    to right and returns the last match, matching the shell's "last wins"
+    semantics when a flag is specified more than once.
+    """
+    last_value: str | None = None
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        matched = False
+        for name in names:
+            if tok == name:
+                if i + 1 < len(tokens):
+                    last_value = tokens[i + 1]
+                i += 2
+                matched = True
+                break
+            if tok.startswith(name + "="):
+                last_value = tok.split("=", 1)[1]
+                i += 1
+                matched = True
+                break
+        if not matched:
+            i += 1
+    return last_value
+
+
+def _compute_vllm_dp_ray_serving_nodes(server_args: str, num_gpus: int, num_nodes: int) -> int:
+    """Compute how many SLURM ranks participate in vLLM serving for vllm_dp_ray.
+
+    Parses ``--tensor-parallel-size``, ``--pipeline-parallel-size``, and
+    ``--data-parallel-size`` out of ``server_args`` (shlex-split, last match
+    wins) and returns ``dp_size × ceil(tp*pp / num_gpus)``. Raises
+    ``ValueError`` on inconsistent topology.
+    """
+    tokens = shlex.split(server_args or "")
+    tp = int(_parse_last_flag(tokens, "--tensor-parallel-size", "--tensor_parallel_size", "-tp") or 1)
+    pp = int(_parse_last_flag(tokens, "--pipeline-parallel-size", "--pipeline_parallel_size", "-pp") or 1)
+    dp_raw = _parse_last_flag(tokens, "--data-parallel-size", "--data_parallel_size", "-dp")
+    if dp_raw is None:
+        raise ValueError(
+            "server_type=vllm_dp_ray requires --data-parallel-size to be set explicitly "
+            "in server_args. For single-replica serving use server_type=vllm instead."
+        )
+    dp = int(dp_raw)
+    world_size = tp * pp
+    if world_size > num_gpus:
+        if world_size % num_gpus != 0:
+            raise ValueError(
+                f"vllm_dp_ray: world_size={world_size} (tp={tp} × pp={pp}) must be an integer "
+                f"multiple of num_gpus={num_gpus} for multi-node DP replicas."
+            )
+        replica_nodes = world_size // num_gpus
+    else:
+        replica_nodes = 1
+    serving_nodes = dp * replica_nodes
+    if serving_nodes > num_nodes:
+        raise ValueError(
+            f"vllm_dp_ray: dp={dp} × replica_nodes={replica_nodes} = {serving_nodes} serving nodes "
+            f"exceeds num_nodes={num_nodes}. Allocate more nodes, reduce dp, or reduce tp*pp."
+        )
+    return serving_nodes
+
+
+def get_ray_server_cmd(start_cmd, serving_nodes: int | None = None, num_gpus: int | None = None):
     """Build the Ray-cluster startup script for multi-node serving.
 
-    If ``dp_size`` is provided and < total num_nodes, workers with
-    ``SLURM_PROCID >= dp_size`` join Ray with ``--num-gpus=0`` and a
-    custom ``extra_gpu`` resource. This hides their GPUs from vLLM's
-    GPU discovery (so DP placement/coordination ignores them) while
-    still exposing a resource that opt-in Ray tasks (e.g. neural-eval
-    metrics like xCOMET) can schedule against via
+    If ``serving_nodes`` is provided and < total num_nodes, workers with
+    ``SLURM_PROCID >= serving_nodes`` join Ray with ``--num-gpus=0`` and a
+    custom ``extra_gpu`` resource advertising ``num_gpus`` slots. This hides
+    their GPUs from vLLM's GPU discovery (so DP placement/coordination
+    ignores them) while still exposing a resource that opt-in Ray tasks
+    (e.g. neural-eval metrics like xCOMET) can schedule against via
     ``@ray.remote(num_gpus=0, resources={"extra_gpu": 1})``. Such tasks
     must also set ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` on
     the node so physical GPUs remain visible to the task process.
+
+    ``serving_nodes`` counts all ranks that participate in vLLM serving,
+    i.e. ``data_parallel_size × ceil(tp*pp / num_gpus)`` — not just
+    ``data_parallel_size``, so multi-node DP replicas (tp*pp > num_gpus)
+    are handled correctly.
     """
     ports = (
         "--node-manager-port=12345 "
@@ -105,11 +177,13 @@ def get_ray_server_cmd(start_cmd, dp_size: int | None = None):
         "--max-worker-port=18349 "
     )
 
-    if dp_size is not None:
-        # Worker branch: split on whether this rank participates in DP.
+    if serving_nodes is not None:
+        if num_gpus is None:
+            raise ValueError("get_ray_server_cmd: num_gpus must be set when serving_nodes is set")
+        # Worker branch: split on whether this rank participates in vLLM serving.
         worker_branch = (
-            'if [ "${SLURM_PROCID:-0}" -lt ' + str(dp_size) + " ]; then "
-            "    echo 'Starting DP worker node' && "
+            'if [ "${SLURM_PROCID:-0}" -lt ' + str(serving_nodes) + " ]; then "
+            "    echo 'Starting serving worker node' && "
             "    ray start "
             "        --block "
             "        --address=$SLURM_MASTER_NODE:6379 "
@@ -121,7 +195,7 @@ def get_ray_server_cmd(start_cmd, dp_size: int | None = None):
             "        --block "
             "        --address=$SLURM_MASTER_NODE:6379 "
             "        --num-gpus=0 "
-            "        --resources='{\"extra_gpu\": 8}' "
+            f"       --resources='{{\"extra_gpu\": {num_gpus}}}' "
             f"       {ports} ;"
             "fi"
         )
@@ -218,8 +292,9 @@ def get_server_command(
     elif server_type == "vllm_dp_ray":
         # Same interface as `vllm`, but starts vLLM in-process on the Ray head
         # so NeMo Gym's DP-on-Ray placement-group monkey-patch takes effect.
-        # Required when total Ray nodes > data_parallel_size (e.g. an extra
-        # node reserved for a Ray-scheduled neural-eval task).
+        # Required when total Ray nodes > serving_nodes (e.g. an extra
+        # node reserved for a Ray-scheduled neural-eval task), and also
+        # supports multi-node DP replicas (tp*pp > num_gpus per node).
         server_entrypoint = server_entrypoint or "-m nemo_skills.inference.server.serve_vllm_dp_ray"
         start_vllm_cmd = (
             f"python3 {server_entrypoint} "
@@ -229,21 +304,16 @@ def get_server_command(
             f"    --port {server_port} "
             f"    {server_args} "
         )
-        # Parse --data-parallel-size out of server_args so Ray can start
-        # extra (non-DP) workers with --num-gpus=0 + extra_gpu custom
-        # resource. This hides their GPUs from vLLM's discovery (so DP
-        # placement-group + compiled-DAG coordination don't trip over
-        # an untracked idle node) while keeping them reachable for
-        # opt-in Ray tasks like xCOMET scoring.
-        import re
-
-        dp_match = re.search(r"(?:^|\s)--?data[-_]parallel[-_]size[= ](\d+)", server_args or "")
-        dp_size = int(dp_match.group(1)) if dp_match else num_nodes
+        serving_nodes = _compute_vllm_dp_ray_serving_nodes(server_args, num_gpus, num_nodes)
 
         # Ray must be started externally for this path: the wrapper calls
         # ray.init(address="auto") and relies on an already-running cluster
         # so it can pre-reserve DP rank 0's PG before vLLM boots.
-        server_start_cmd = get_ray_server_cmd(start_vllm_cmd, dp_size=dp_size)
+        server_start_cmd = get_ray_server_cmd(
+            start_vllm_cmd,
+            serving_nodes=serving_nodes,
+            num_gpus=num_gpus,
+        )
         num_tasks = 1
     elif server_type == "sglang":
         if num_nodes > 1:

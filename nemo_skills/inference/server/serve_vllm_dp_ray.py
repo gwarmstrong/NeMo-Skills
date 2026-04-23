@@ -89,6 +89,12 @@ def _apply_vllm_patches() -> None:
         dp_size = vllm_config.parallel_config.data_parallel_size
         dp_size_local = vllm_config.parallel_config.data_parallel_size_local
 
+        if dp_size_local != 1:
+            raise NotImplementedError(
+                f"serve_vllm_dp_ray does not support data-parallel-size-local={dp_size_local}. "
+                "Each DP replica must occupy its own node(s); set --data-parallel-size-local=1."
+            )
+
         available_resources = available_resources_per_node()
 
         # Strip per-PG synthetic resource keys (e.g. "node:<ip>_group_<hex>")
@@ -231,55 +237,97 @@ def _apply_vllm_patches() -> None:
 _HEAD_PG_REF: dict = {}
 
 
-def _reserve_head_placement_group(server_name: str, tp_size: int, pp_size: int, pack_strategy: str):
-    """Pre-reserve DP rank 0's placement group pinned to this node."""
+def _reserve_head_placement_group(
+    server_name: str,
+    tp_size: int,
+    pp_size: int,
+    pack_strategy: str,
+    num_gpus_per_node: int,
+    timeout_s: int = 300,
+):
+    """Pre-reserve DP rank 0's placement group with only bundle 0 pinned to this node.
+
+    For single-node DP replicas (``world_size <= num_gpus_per_node``), STRICT_PACK
+    keeps the whole PG on this node. For multi-node DP replicas
+    (``world_size > num_gpus_per_node``), strategy falls back to PACK and only
+    the first bundle is pinned — Ray's PACK minimises spread while honouring
+    the pin, so the PG anchors here and spills onto additional nodes as needed.
+    This mixed-pinning pattern was validated empirically on draco-oci (see
+    Phase 0 spike: ``bundle 0 on head 8/8 trials`` for both ws=8 and ws=16).
+
+    The api_server runs in the caller's process on this node (rank 0), so
+    colocating bundle 0 with the api_server minimises coordination RPC hops
+    to DP rank 0's first GPU worker.
+    """
     import ray
     from ray._private.services import get_node_ip_address
 
     node_ip = get_node_ip_address()
     node_resource_key = f"node:{node_ip}"
-
-    placement_strategy = "STRICT_PACK" if pack_strategy in ("strict", "fill") else "PACK"
     world_size = tp_size * pp_size
 
-    # Each bundle asks for 1 GPU + a small share of this node's node:<ip>
-    # auto-resource, which pins the bundle to this specific node. This
-    # guarantees the api_server (which we launch in this process) is
-    # colocated with DP rank 0's compute.
-    bundles = [{"GPU": 1.0, node_resource_key: 0.01} for _ in range(world_size)] + [
-        {"CPU": 1.0, node_resource_key: 0.01}
-    ]
+    if world_size > num_gpus_per_node:
+        placement_strategy = "PACK"
+    else:
+        placement_strategy = "STRICT_PACK" if pack_strategy in ("strict", "fill") else "PACK"
+
+    # Pin only bundle 0 to this node (anchors the PG + colocates with
+    # api_server). Remaining bundles float — PACK keeps them on the same
+    # node when it fits, spills to additional nodes when it doesn't.
+    bundles: list[dict] = [{"GPU": 1.0, node_resource_key: 0.01}]
+    bundles += [{"GPU": 1.0} for _ in range(world_size - 1)]
+    bundles += [{"CPU": 1.0}]
+
     pg = ray.util.placement_group(
         name=f"{server_name}_dp_rank_0",
         strategy=placement_strategy,
         bundles=bundles,
     )
-    ray.get(pg.ready())
+    try:
+        ray.get(pg.ready(), timeout=timeout_s)
+    except ray.exceptions.GetTimeoutError as e:
+        raise RuntimeError(
+            f"Head placement group not ready after {timeout_s}s. "
+            f"strategy={placement_strategy}, world_size={world_size}, "
+            f"num_gpus_per_node={num_gpus_per_node}. "
+            "Check Ray cluster resources: `ray status` from inside the job."
+        ) from e
 
     return pg, node_ip
 
 
 def _patch_signal_for_thread_safety() -> None:
-    """No-op signal installation.
+    """No-op ``signal.signal`` when running off the main thread.
 
     vLLM's ``launcher.serve_http`` installs SIGINT/SIGTERM handlers via
     ``loop.add_signal_handler`` + ``signal.signal``. Neither is safe when
-    a nested event loop runs off the main thread. We run on main thread
-    here, so this is defensive — only needed if a future caller wraps
-    this entrypoint in a background thread.
+    a nested event loop runs off the main thread. When we're on the main
+    thread (the normal case), this is a no-op so we don't clobber signal
+    handling for subprocess / asyncio cleanup elsewhere in the process.
     """
+    import threading
+
+    if threading.current_thread() is threading.main_thread():
+        return
     signal.signal = lambda *a, **kw: None
 
 
 def _build_vllm_argv(args: argparse.Namespace, extra: Sequence[str]) -> list[str]:
-    """Build the argv that vLLM's ``make_arg_parser()`` will parse."""
+    """Build the argv that vLLM's ``make_arg_parser()`` will parse.
+
+    Note: ``--tensor-parallel-size`` / ``--pipeline-parallel-size`` /
+    ``--data-parallel-size`` must be passed explicitly via ``extra`` (i.e.
+    via ``server_args`` in the pipeline). We do NOT auto-infer them from
+    ``num_gpus × num_nodes`` because the vllm_dp_ray topology
+    (DP replicas × TP/PP per replica × extra Ray-only nodes) cannot be
+    derived from that product alone.
+    """
     argv = [
         f"--model={args.model}",
         f"--served-model-name={args.model}",
         "--trust-remote-code",
         "--host=0.0.0.0",
         f"--port={args.port}",
-        f"--tensor-parallel-size={args.num_gpus * args.num_nodes}",
     ]
     if args.no_verbose:
         argv.extend(["--disable-log-requests", "--disable-log-stats"])
@@ -324,12 +372,26 @@ def main() -> None:
     tp_size = getattr(vllm_args, "tensor_parallel_size", 1)
     pp_size = getattr(vllm_args, "pipeline_parallel_size", 1)
     dp_size = getattr(vllm_args, "data_parallel_size", 1)
+    world_size = tp_size * pp_size
 
-    # Default pack strategy — matches vLLM's Ray DP path. Callers can
-    # override via VLLM_RAY_DP_PACK_STRATEGY in the submitting env.
-    pack_strategy = os.environ.setdefault("VLLM_RAY_DP_PACK_STRATEGY", "strict")
+    # Auto-select pack strategy based on whether a DP replica fits on one
+    # node. Upstream vLLM's patched create_dp_placement_groups requires
+    # VLLM_RAY_DP_PACK_STRATEGY=span for multi-node DP replicas and
+    # strict/fill for single-node replicas. Caller can still override.
+    default_pack = "span" if world_size > args.num_gpus else "strict"
+    pack_strategy = os.environ.setdefault("VLLM_RAY_DP_PACK_STRATEGY", default_pack)
 
-    print(f"[serve_vllm_dp_ray] tp={tp_size} pp={pp_size} dp={dp_size} pack_strategy={pack_strategy}")
+    print(
+        f"[serve_vllm_dp_ray] tp={tp_size} pp={pp_size} dp={dp_size} "
+        f"world_size={world_size} num_gpus_per_node={args.num_gpus} "
+        f"pack_strategy={pack_strategy}"
+    )
+
+    if world_size > args.num_gpus and world_size % args.num_gpus != 0:
+        raise ValueError(
+            f"world_size={world_size} (tp={tp_size} × pp={pp_size}) must be an integer "
+            f"multiple of num_gpus_per_node={args.num_gpus} for multi-node DP replicas."
+        )
 
     # ------------------------------------------------------------------------------
     # Attach to the existing Ray cluster (started by get_ray_server_cmd for
@@ -348,6 +410,7 @@ def main() -> None:
         tp_size=tp_size,
         pp_size=pp_size,
         pack_strategy=pack_strategy,
+        num_gpus_per_node=args.num_gpus,
     )
     os.environ["VLLM_DP_MASTER_IP"] = node_ip
     print(f"[serve_vllm_dp_ray] Reserved head PG on {node_ip} (DP rank 0)")

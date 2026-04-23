@@ -353,6 +353,19 @@ def _build_vllm_argv(args: argparse.Namespace, extra: Sequence[str]) -> list[str
         # which packs all replicas onto the coordinator's node and then
         # tries to advertise GPU indices it doesn't have.
         argv.append("--data-parallel-size-local=1")
+    has_dp_backend = any(
+        tok in ("--data-parallel-backend", "--data_parallel_backend")
+        or tok.startswith("--data-parallel-backend=")
+        or tok.startswith("--data_parallel_backend=")
+        for tok in extra
+    )
+    if not has_dp_backend:
+        # vLLM's launch_core_engines selects CoreEngineActorManager (Ray-actor-based
+        # DP engines, what our create_dp_placement_groups monkey-patch expects) only
+        # when parallel_config.data_parallel_backend == "ray". Default is "mp", which
+        # routes through CoreEngineProcManager and requires a separate `vllm serve`
+        # invocation per node — not what we want for Ray-orchestrated multi-node DP.
+        argv.append("--data-parallel-backend=ray")
     argv.extend(extra)
     return argv
 

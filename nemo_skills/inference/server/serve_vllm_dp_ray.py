@@ -450,6 +450,16 @@ def main() -> None:
     # our help here.
     if dp_size == 1:
         print("[serve_vllm_dp_ray] dp_size=1: deferring to vLLM's native ray_executor path")
+        # Even on the DP=1 fast path, vLLM's CoreEngineActorManager still
+        # walks ``create_dp_placement_groups`` and asserts the configured
+        # ``dp_master_ip`` is present on a live Ray node. Without an explicit
+        # override it stays at the default ``127.0.0.1``, which the
+        # multi-node Ray cluster doesn't see → AssertionError "DP master node
+        # (ip: 127.0.0.1) is missing or dead". Set it to the head node IP
+        # the same way the DP>1 path does.
+        from ray._private.services import get_node_ip_address
+
+        os.environ["VLLM_DP_MASTER_IP"] = get_node_ip_address()
         _patch_signal_for_thread_safety()
         from vllm.entrypoints.openai.api_server import run_server
 

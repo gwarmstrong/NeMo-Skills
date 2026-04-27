@@ -292,8 +292,6 @@ def _reserve_head_placement_group(
     (``world_size > num_gpus_per_node``), strategy falls back to PACK and only
     the first bundle is pinned — Ray's PACK minimises spread while honouring
     the pin, so the PG anchors here and spills onto additional nodes as needed.
-    This mixed-pinning pattern was validated empirically on draco-oci (see
-    Phase 0 spike: ``bundle 0 on head 8/8 trials`` for both ws=8 and ws=16).
 
     The api_server runs in the caller's process on this node (rank 0), so
     colocating bundle 0 with the api_server minimises coordination RPC hops

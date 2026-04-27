@@ -56,7 +56,7 @@ _COMMON_CTX = (
     "++policy_model.responses_api_models.vllm_model.extra_body.top_k=20 "
 )
 
-_NEMOTRON = "/hf_models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+_NEMOTRON = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 _DSV2_LITE = "deepseek-ai/DeepSeek-V2-Lite"
 
 
@@ -88,6 +88,7 @@ def _submit(
     num_extra_nodes: int,
     num_samples_in_parallel: int,
     gpus_per_node: int = 8,
+    partition: str | None = None,
     extra_ctx: str = "",
     reasoning_parser: bool = False,
 ) -> str:
@@ -130,13 +131,12 @@ def _submit(
         input_file="benchmarks/wmt24pp/data/wmt24pp_benchmark.jsonl",
         output_dir=output_dir,
         log_dir=f"{output_dir}/logs",
-        gym_path="/opt/Gym",
         model=model,
         server_type="vllm_dp_ray",
         server_gpus=gpus_per_node,
         server_nodes=num_nodes,
         server_args=_server_args(tp_size, dp_size, reasoning_parser),
-        partition="pool0",
+        partition=partition,
         exclusive=True,
         expname=expname,
     )
@@ -156,6 +156,11 @@ def main():
         "(nodes_per_replica = ceil(TP/gpus_per_node)) and the COMET actor "
         "count (comet_num_shards = num_extra_nodes * gpus_per_node).",
     )
+    parser.add_argument(
+        "--partition",
+        default=None,
+        help="SLURM partition. Defaults to the cluster config's default partition.",
+    )
     args = parser.parse_args()
 
     expnames = [
@@ -165,6 +170,7 @@ def main():
             cluster=args.cluster,
             expname_prefix=args.expname_prefix,
             gpus_per_node=args.gpus_per_node,
+            partition=args.partition,
             model=_NEMOTRON,
             tp_size=8,
             dp_size=1,
@@ -178,6 +184,7 @@ def main():
             cluster=args.cluster,
             expname_prefix=args.expname_prefix,
             gpus_per_node=args.gpus_per_node,
+            partition=args.partition,
             model=_NEMOTRON,
             tp_size=8,
             dp_size=4,
@@ -191,6 +198,7 @@ def main():
             cluster=args.cluster,
             expname_prefix=args.expname_prefix,
             gpus_per_node=args.gpus_per_node,
+            partition=args.partition,
             model=_DSV2_LITE,
             tp_size=16,
             dp_size=2,
@@ -204,6 +212,7 @@ def main():
             cluster=args.cluster,
             expname_prefix=args.expname_prefix,
             gpus_per_node=args.gpus_per_node,
+            partition=args.partition,
             model=_DSV2_LITE,
             tp_size=16,
             dp_size=1,
@@ -217,6 +226,7 @@ def main():
             cluster=args.cluster,
             expname_prefix=args.expname_prefix,
             gpus_per_node=args.gpus_per_node,
+            partition=args.partition,
             model=_NEMOTRON,
             tp_size=8,
             dp_size=1,

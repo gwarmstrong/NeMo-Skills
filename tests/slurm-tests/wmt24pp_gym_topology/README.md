@@ -43,10 +43,12 @@ The test reuses the recipe's existing setup. Cluster config must provide:
 
 - A workspace mount (typically `/workspace` per `slurm-tests/README.md`).
 - The vllm + nemo-rl + sandbox containers from `cluster_configs/<cluster>.yaml`.
-- HF_HOME with both `Unbabel/XCOMET-XXL` and `deepseek-ai/DeepSeek-V2-Lite`
-  pre-downloaded (xCOMET cold-load goes online to facebook/xlm-roberta-xxl,
-  but the actor pool retries 429s; see `wmt_translation/app.py`).
-- Local Nemotron-3-Nano weights mounted at `/hf_models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`.
+- `HF_HOME` populated with the three required models (or a network path that
+  can fetch them on cold-load):
+  - `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` (gated; used by C1/C2/C5)
+  - `deepseek-ai/DeepSeek-V2-Lite` (used by C3/C4)
+  - `Unbabel/XCOMET-XXL` (xCOMET also goes online to `facebook/xlm-roberta-xxl`
+    on first load; the actor pool retries 429s — see `wmt_translation/app.py`).
 
 ## Running
 

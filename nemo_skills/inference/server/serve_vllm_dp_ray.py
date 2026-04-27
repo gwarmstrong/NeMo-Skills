@@ -36,6 +36,44 @@ serve vLLM via ``nemo_skills.inference.server`` (``nemo_gym_rollouts``,
 The patches are intended to be temporary — see the upstream vLLM PR
 discussion for the long-term fix.
 
+Caveats and version coupling (vLLM 0.18.1)
+-------------------------------------------
+This file is tightly coupled to vLLM's internal placement-group code.
+Symbols imported from ``vllm.v1.engine.utils`` (``CoreEngineActorManager``,
+``current_platform``) and ``vllm.v1.engine.core`` (``DPEngineCoreProc``)
+are private and have shifted between vLLM minor releases. Last validated
+against vLLM 0.18.1 with the wmt24pp_gym_topology slurm test (5
+topologies × {Nemotron-3-Nano, DeepSeek-V2-Lite}). After any vLLM bump:
+  * Re-run ``tests/slurm-tests/wmt24pp_gym_topology`` end-to-end — it
+    catches every regression mode we've seen (engine init, head-PG
+    layout, hung api_server, lost extra_gpu node, missed per-row scores).
+  * Re-read ``new_create_dp_placement_groups`` against the current vLLM
+    version of the same function — the patch shadows the original, so
+    silent drift won't fail loudly until a topology that exercises the
+    diff hits production.
+
+Coordination with ``get_ray_server_cmd``
+-----------------------------------------
+The "extra_gpu" trick this file relies on is implemented in
+``nemo_skills/pipeline/utils/server.py:get_ray_server_cmd``: nodes beyond
+``serving_nodes`` join Ray with ``--num-gpus=0
+--resources='{"extra_gpu": <gpus_per_node>}'``. Their physical GPUs are
+hidden from Ray's normal accounting (so vLLM's compiled-DAG node scan
+doesn't trip on them) but are reachable to Ray tasks that explicitly
+request ``resources={"extra_gpu": 1}`` plus the
+``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` env flag. If that
+launch contract changes (e.g. someone drops ``--num-gpus=0``), the COMET
+actor pool silently never schedules and downstream resource servers fall
+back to end-of-batch dispatch — the wmt24pp slurm test catches this as
+``0/N rows with comet_score``.
+
+Private Ray API
+---------------
+``ray._private.services.get_node_ip_address`` (used to set
+``VLLM_DP_MASTER_IP``) is a private import and could be moved or removed
+in any Ray release. Both the DP=1 fast path and ``_reserve_head_placement_group``
+use it — keep them in lockstep so they break together if Ray renames it.
+
 Usage
 -----
 Drop-in replacement for ``serve_vllm.py``. Select via
@@ -436,20 +474,31 @@ def main() -> None:
 
     ray.init(address="auto" if args.num_nodes > 1 else None, ignore_reinit_error=True)
 
-    # DP=1, single-node TP: vLLM's ray_executor path handles this fine
-    # without our patches. Pre-reserving a head PG here would just steal
-    # the GPUs vLLM is about to ask for (engine then errors with "Current
-    # node has no GPU available"). We just set VLLM_DP_MASTER_IP so the
-    # CoreEngineActorManager assertion passes, and let vLLM drive.
+    # The dp_size==1 fast path bifurcates by whether the single replica
+    # fits on one node or not. The gate condition matters; do NOT relax
+    # it without re-validating both branches end-to-end. Validation lives
+    # in tests/slurm-tests/wmt24pp_gym_topology (configs C1 + C4).
     #
-    # DP=1, cross-node TP (world_size > num_gpus_per_node): the unpatched
-    # vLLM `create_dp_placement_groups` uses `available_resources_per_node`,
-    # which sees 0 GPUs on our extra_gpu nodes (those nodes joined Ray with
-    # `--num-gpus=0` to hide GPUs from DP/compiled-DAG accounting). That
-    # miscomputes max_device_per_node and the engine hangs after KV-cache
-    # init. Use the patched path: pre-reserve the head PG (covering the
-    # full world_size, spanning multiple nodes) and apply the patches that
-    # use `total_resources_per_node` for the dp_size==1 branch.
+    # SINGLE-NODE DP=1 (this branch): TP fits on one node. vLLM's
+    # ray_executor path handles this fine without our patches. Pre-reserving
+    # a head PG here would just steal the GPUs vLLM is about to ask for
+    # (engine then errors with "Current node has no GPU available"). We
+    # only set VLLM_DP_MASTER_IP so the CoreEngineActorManager assertion
+    # passes, and let vLLM drive. Validated by C1 (TP=8 DP=1 + 1 extra
+    # COMET node).
+    #
+    # CROSS-NODE DP=1 (the else branch below, falls through to the
+    # DP>1-style head-PG path): TP > num_gpus_per_node, replica spans 2+
+    # nodes. The UNPATCHED vLLM ``create_dp_placement_groups`` uses
+    # ``available_resources_per_node``, which sees 0 GPUs on our extra_gpu
+    # nodes (those nodes joined Ray with ``--num-gpus=0`` per
+    # get_ray_server_cmd). max_device_per_node miscomputes, the engine
+    # init succeeds and KV cache allocates, but the OpenAI api_server
+    # hangs after — never binds the listener. Observed in C4 (TP=16 DP=1
+    # cross-node) on every run before this gate landed. The PATCHED path
+    # uses ``total_resources_per_node`` for the dp_size==1 branch (in
+    # ``new_create_dp_placement_groups`` above), which sees through the
+    # extra-node masking.
     if dp_size == 1 and world_size <= args.num_gpus:
         print("[serve_vllm_dp_ray] dp_size=1 single-node: deferring to vLLM's native ray_executor path")
         from ray._private.services import get_node_ip_address

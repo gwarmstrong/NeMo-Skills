@@ -87,17 +87,44 @@ def _submit(
     dp_size: int,
     num_extra_nodes: int,
     num_samples_in_parallel: int,
+    gpus_per_node: int = 8,
     extra_ctx: str = "",
     reasoning_parser: bool = False,
 ) -> str:
-    """Submit one topology configuration; return its expname for run_after wiring."""
-    nodes_per_replica = max(1, tp_size // 8)  # 8 GPUs/node assumption
+    """Submit one topology configuration; return its expname for run_after wiring.
+
+    ``gpus_per_node`` defaults to 8 (the H100 cluster shape we develop on)
+    but flows through to both the SLURM allocation (``server_gpus``) and the
+    derived COMET sharding so this test runs unchanged on 4-GPU/node nodes:
+
+      * ``nodes_per_replica = ceil(world_size / gpus_per_node)`` — replica
+        spans ``ceil(TP*PP / gpus_per_node)`` nodes (TP=16 → 2 nodes on 8-GPU,
+        4 nodes on 4-GPU).
+      * ``comet_num_shards = num_extra_nodes * gpus_per_node`` — actor pool
+        saturates the extra_gpu nodes regardless of cluster shape.
+
+    Per-config ``extra_ctx`` overrides win over the auto-computed default,
+    so callers can clamp the actor pool down for memory-constrained nodes
+    or up for benchmarking — but most callers should leave it alone.
+    """
+    nodes_per_replica = max(1, -(-tp_size // gpus_per_node))  # ceil divide
     num_nodes = dp_size * nodes_per_replica + num_extra_nodes
+    comet_num_shards = num_extra_nodes * gpus_per_node
     expname = f"{expname_prefix}_{name}"
     output_dir = f"{workspace}/{name}"
 
+    ctx_str = (
+        _COMMON_CTX
+        + f"+num_samples_in_parallel={num_samples_in_parallel} "
+        + (
+            "++wmt24pp_wmt_translation_resources_server.resources_servers."
+            f"wmt_translation.comet_num_shards={comet_num_shards} "
+        )
+        + extra_ctx
+    )
+
     nemo_gym_rollouts(
-        ctx=wrap_arguments(_COMMON_CTX + f"+num_samples_in_parallel={num_samples_in_parallel} " + extra_ctx),
+        ctx=wrap_arguments(ctx_str),
         cluster=cluster,
         config_paths=("benchmarks/wmt24pp/config.yaml,responses_api_models/vllm_model/configs/vllm_model.yaml"),
         input_file="benchmarks/wmt24pp/data/wmt24pp_benchmark.jsonl",
@@ -106,7 +133,7 @@ def _submit(
         gym_path="/opt/Gym",
         model=model,
         server_type="vllm_dp_ray",
-        server_gpus=8,
+        server_gpus=gpus_per_node,
         server_nodes=num_nodes,
         server_args=_server_args(tp_size, dp_size, reasoning_parser),
         partition="pool0",
@@ -121,6 +148,14 @@ def main():
     parser.add_argument("--workspace", required=True, help="Workspace dir for all 5 topology outputs")
     parser.add_argument("--cluster", required=True, help="Cluster config name (e.g. aws-iad)")
     parser.add_argument("--expname_prefix", required=True, help="Prefix for the 5 + 1 SLURM experiments")
+    parser.add_argument(
+        "--gpus_per_node",
+        type=int,
+        default=8,
+        help="GPUs per cluster node (default 8). Drives both replica sizing "
+        "(nodes_per_replica = ceil(TP/gpus_per_node)) and the COMET actor "
+        "count (comet_num_shards = num_extra_nodes * gpus_per_node).",
+    )
     args = parser.parse_args()
 
     expnames = [
@@ -129,6 +164,7 @@ def main():
             workspace=args.workspace,
             cluster=args.cluster,
             expname_prefix=args.expname_prefix,
+            gpus_per_node=args.gpus_per_node,
             model=_NEMOTRON,
             tp_size=8,
             dp_size=1,
@@ -141,6 +177,7 @@ def main():
             workspace=args.workspace,
             cluster=args.cluster,
             expname_prefix=args.expname_prefix,
+            gpus_per_node=args.gpus_per_node,
             model=_NEMOTRON,
             tp_size=8,
             dp_size=4,
@@ -153,6 +190,7 @@ def main():
             workspace=args.workspace,
             cluster=args.cluster,
             expname_prefix=args.expname_prefix,
+            gpus_per_node=args.gpus_per_node,
             model=_DSV2_LITE,
             tp_size=16,
             dp_size=2,
@@ -165,6 +203,7 @@ def main():
             workspace=args.workspace,
             cluster=args.cluster,
             expname_prefix=args.expname_prefix,
+            gpus_per_node=args.gpus_per_node,
             model=_DSV2_LITE,
             tp_size=16,
             dp_size=1,
@@ -177,15 +216,14 @@ def main():
             workspace=args.workspace,
             cluster=args.cluster,
             expname_prefix=args.expname_prefix,
+            gpus_per_node=args.gpus_per_node,
             model=_NEMOTRON,
             tp_size=8,
             dp_size=1,
             num_extra_nodes=2,
             num_samples_in_parallel=64,
-            # 16-shard COMET pool: 8 GPUs × 2 extra nodes.
-            extra_ctx=(
-                "++wmt24pp_wmt_translation_resources_server.resources_servers.wmt_translation.comet_num_shards=16 "
-            ),
+            # comet_num_shards auto-derives to num_extra_nodes * gpus_per_node
+            # (16 on 8-GPU/node, 8 on 4-GPU/node) — saturates whichever cluster.
             reasoning_parser=True,
         ),
     ]

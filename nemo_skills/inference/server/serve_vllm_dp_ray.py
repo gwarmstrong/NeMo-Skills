@@ -33,8 +33,10 @@ monkey-patches (``_patch_create_dp_placement_groups`` and
 serve vLLM via ``nemo_skills.inference.server`` (``nemo_gym_rollouts``,
 ``generate``, ``eval``, ...) can use the extra-node topology too.
 
-The patches are intended to be temporary — see the upstream vLLM PR
-discussion for the long-term fix.
+The patches are intended to be temporary — see upstream vLLM issue
+https://github.com/vllm-project/vllm/issues/32400 ("Ray cluster (5 Node),
+Deploy DP=2, Creating too many placement groups") for the discussion of
+the long-term fix.
 
 Caveats and version coupling (vLLM 0.18.1)
 -------------------------------------------

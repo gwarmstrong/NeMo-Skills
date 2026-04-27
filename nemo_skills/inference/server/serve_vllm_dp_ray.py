@@ -436,27 +436,22 @@ def main() -> None:
 
     ray.init(address="auto" if args.num_nodes > 1 else None, ignore_reinit_error=True)
 
-    # DP=1 takes a different code path inside vLLM: the ray_executor
-    # calls ``initialize_ray_cluster`` directly and creates its own PGs
-    # from whatever GPUs are free on the cluster. That path does NOT use
-    # ``CoreEngineActorManager.create_dp_placement_groups``, so our
-    # monkey-patch wouldn't activate — and pre-reserving a head PG here
-    # would just steal the GPUs vLLM is about to ask for (the engine
-    # then errors with "Current node has no GPU available").
+    # DP=1, single-node TP: vLLM's ray_executor path handles this fine
+    # without our patches. Pre-reserving a head PG here would just steal
+    # the GPUs vLLM is about to ask for (engine then errors with "Current
+    # node has no GPU available"). We just set VLLM_DP_MASTER_IP so the
+    # CoreEngineActorManager assertion passes, and let vLLM drive.
     #
-    # For DP=1 we therefore skip the reservation + patches entirely and
-    # let vLLM drive. The extra-node hiding (if any) was already applied
-    # at ``ray start`` time by ``get_ray_server_cmd`` and doesn't need
-    # our help here.
-    if dp_size == 1:
-        print("[serve_vllm_dp_ray] dp_size=1: deferring to vLLM's native ray_executor path")
-        # Even on the DP=1 fast path, vLLM's CoreEngineActorManager still
-        # walks ``create_dp_placement_groups`` and asserts the configured
-        # ``dp_master_ip`` is present on a live Ray node. Without an explicit
-        # override it stays at the default ``127.0.0.1``, which the
-        # multi-node Ray cluster doesn't see → AssertionError "DP master node
-        # (ip: 127.0.0.1) is missing or dead". Set it to the head node IP
-        # the same way the DP>1 path does.
+    # DP=1, cross-node TP (world_size > num_gpus_per_node): the unpatched
+    # vLLM `create_dp_placement_groups` uses `available_resources_per_node`,
+    # which sees 0 GPUs on our extra_gpu nodes (those nodes joined Ray with
+    # `--num-gpus=0` to hide GPUs from DP/compiled-DAG accounting). That
+    # miscomputes max_device_per_node and the engine hangs after KV-cache
+    # init. Use the patched path: pre-reserve the head PG (covering the
+    # full world_size, spanning multiple nodes) and apply the patches that
+    # use `total_resources_per_node` for the dp_size==1 branch.
+    if dp_size == 1 and world_size <= args.num_gpus:
+        print("[serve_vllm_dp_ray] dp_size=1 single-node: deferring to vLLM's native ray_executor path")
         from ray._private.services import get_node_ip_address
 
         os.environ["VLLM_DP_MASTER_IP"] = get_node_ip_address()

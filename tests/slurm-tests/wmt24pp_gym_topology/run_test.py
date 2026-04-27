@@ -146,7 +146,7 @@ def _submit(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", required=True, help="Workspace dir for all 5 topology outputs")
-    parser.add_argument("--cluster", required=True, help="Cluster config name (e.g. aws-iad)")
+    parser.add_argument("--cluster", required=True, help="Cluster config name")
     parser.add_argument("--expname_prefix", required=True, help="Prefix for the 5 + 1 SLURM experiments")
     parser.add_argument(
         "--gpus_per_node",

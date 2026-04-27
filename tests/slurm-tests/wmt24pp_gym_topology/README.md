@@ -52,7 +52,7 @@ The test reuses the recipe's existing setup. Cluster config must provide:
 
 ```bash
 python tests/slurm-tests/wmt24pp_gym_topology/run_test.py \
-    --cluster aws-iad \
+    --cluster <your-cluster> \
     --workspace /workspace/nemo-skills-slurm-ci/wmt24pp_gym_topology \
     --expname_prefix wmt24pp_gym_topology_$(date +%Y-%m-%d)
 ```

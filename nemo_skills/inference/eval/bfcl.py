@@ -82,6 +82,12 @@ BFCL_REQUIREMENTS = [
     "faiss-cpu==1.11.0",
     "networkx==3.3",
     "filelock==3.20.0",
+    # Pin tokenizers compatible with the transformers version baked into
+    # nemo-skills/nemo-skills-vllm containers — bfcl_eval otherwise pulls
+    # tokenizers==0.23.1, which hits 'tokenizers>=0.22.0,<=0.23.0 is
+    # required' on container's transformers. Same root issue as Skills'
+    # tests/gpu-tests/test_eval.py TODO.
+    "tokenizers>=0.22.0,<=0.23.0",
 ]
 
 

@@ -43,18 +43,18 @@ class ComputeEvalEvaluator(BaseEvaluator):
             problem = _PROBLEM_ADAPTER.validate_python(data_point["problem"])
             solution = _SOLUTION_ADAPTER.validate_python(data_point["solution"])
 
-            graded = await asyncio.to_thread(
+            graded_list = await asyncio.to_thread(
                 evaluate_solutions,
                 problem=problem,
                 solutions=[solution],
                 eval_mode="local",
                 profile_mode=None,
             )
+            graded = graded_list[0]
 
             return {
                 "passed": graded.passed,
                 "skipped": graded.skipped,
-                "elapsed_time": graded.elapsed_time,
                 "build_output": graded.build_output,
                 "test_output": graded.test_output,
             }
@@ -63,7 +63,6 @@ class ComputeEvalEvaluator(BaseEvaluator):
             return {
                 "passed": False,
                 "skipped": False,
-                "elapsed_time": 0.0,
                 "build_output": "",
                 "test_output": "",
                 "error": f"Missing required field: {e}",
@@ -73,7 +72,6 @@ class ComputeEvalEvaluator(BaseEvaluator):
             return {
                 "passed": False,
                 "skipped": False,
-                "elapsed_time": 0.0,
                 "build_output": "",
                 "test_output": "",
                 "error": str(e),

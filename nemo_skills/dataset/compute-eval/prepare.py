@@ -61,6 +61,12 @@ if __name__ == "__main__":
         default=None,
         help="Release to download (e.g., '2025-1', '2025-2'). If not specified, downloads default release.",
     )
+    parser.add_argument(
+        "--data_dir",
+        type=Path,
+        default=None,
+        help="Output directory for eval.jsonl. Defaults to this script's parent dir (matching nemo_skills convention).",
+    )
 
     args = parser.parse_args()
 
@@ -70,8 +76,12 @@ if __name__ == "__main__":
         exit(1)
 
     dataset = load_dataset("nvidia/compute-eval", args.release, token=token)
-    data_dir = Path(__file__).absolute().parent
-    data_dir.mkdir(exist_ok=True)
+    data_dir = args.data_dir if args.data_dir is not None else Path(__file__).absolute().parent
+    if args.data_dir is not None:
+        # ns prepare_data --data_dir <X> passes X as the root and expects each
+        # benchmark to write into X/<benchmark-name>/. Mirror the convention.
+        data_dir = data_dir / "compute-eval"
+    data_dir.mkdir(parents=True, exist_ok=True)
 
     with open(data_dir / "eval.jsonl", "wt", encoding="utf-8") as f:
         for item in dataset["eval"]:

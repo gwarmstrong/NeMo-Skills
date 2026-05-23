@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import concurrent.futures
 import logging
 from typing import Annotated, Any
 
@@ -38,12 +39,18 @@ class ComputeEvalEvaluator(BaseEvaluator):
             )
         # compute_eval.utils.parsing.find_matching_subtrees uses a tree-sitter
         # Parser from tree_sitter_language_pack, which is a pyo3-backed Rust
-        # type marked unsendable. Skills' eval_single runs concurrently via
-        # asyncio.to_thread on multiple threads, and concurrent calls panic
-        # with "_native::Parser is unsendable, but sent to another thread".
-        # Serialize the evaluate_solutions call to keep all parser interaction
-        # on one thread at a time.
-        self._eval_lock = asyncio.Lock()
+        # type marked unsendable. The compute-eval evaluator caches Parsers
+        # on the module-level language singleton — once a Parser is created
+        # on thread A, any later call from thread B panics with "_native::Parser
+        # is unsendable, but sent to another thread". asyncio.to_thread uses
+        # the default thread pool, which rotates threads, so even serialized
+        # async calls land on different threads.
+        #
+        # Pin all evaluate_solutions calls to a single dedicated worker thread
+        # so the parser is created and used only on that one thread.
+        self._eval_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="compute-eval-parser"
+        )
 
     async def eval_single(self, data_point: dict[str, Any]) -> dict[str, Any]:
         # noinspection PyBroadException
@@ -51,14 +58,16 @@ class ComputeEvalEvaluator(BaseEvaluator):
             problem = _PROBLEM_ADAPTER.validate_python(data_point["problem"])
             solution = _SOLUTION_ADAPTER.validate_python(data_point["solution"])
 
-            async with self._eval_lock:
-                graded_list = await asyncio.to_thread(
-                    evaluate_solutions,
+            loop = asyncio.get_running_loop()
+            graded_list = await loop.run_in_executor(
+                self._eval_executor,
+                lambda: evaluate_solutions(
                     problem=problem,
                     solutions=[solution],
                     eval_mode="local",
                     profile_mode=None,
-                )
+                ),
+            )
             graded = graded_list[0]
 
             return {

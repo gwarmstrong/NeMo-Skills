@@ -36,6 +36,14 @@ class ComputeEvalEvaluator(BaseEvaluator):
             raise RuntimeError(
                 "NVCC not found. Please ensure that the CUDA Toolkit is installed and nvcc is in your PATH."
             )
+        # compute_eval.utils.parsing.find_matching_subtrees uses a tree-sitter
+        # Parser from tree_sitter_language_pack, which is a pyo3-backed Rust
+        # type marked unsendable. Skills' eval_single runs concurrently via
+        # asyncio.to_thread on multiple threads, and concurrent calls panic
+        # with "_native::Parser is unsendable, but sent to another thread".
+        # Serialize the evaluate_solutions call to keep all parser interaction
+        # on one thread at a time.
+        self._eval_lock = asyncio.Lock()
 
     async def eval_single(self, data_point: dict[str, Any]) -> dict[str, Any]:
         # noinspection PyBroadException
@@ -43,13 +51,14 @@ class ComputeEvalEvaluator(BaseEvaluator):
             problem = _PROBLEM_ADAPTER.validate_python(data_point["problem"])
             solution = _SOLUTION_ADAPTER.validate_python(data_point["solution"])
 
-            graded_list = await asyncio.to_thread(
-                evaluate_solutions,
-                problem=problem,
-                solutions=[solution],
-                eval_mode="local",
-                profile_mode=None,
-            )
+            async with self._eval_lock:
+                graded_list = await asyncio.to_thread(
+                    evaluate_solutions,
+                    problem=problem,
+                    solutions=[solution],
+                    eval_mode="local",
+                    profile_mode=None,
+                )
             graded = graded_list[0]
 
             return {
